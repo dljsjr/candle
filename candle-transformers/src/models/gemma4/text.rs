@@ -447,7 +447,13 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            // CNDL-11: the transformers reference runs the attention softmax in f32
+            // (`F.softmax(..., dtype=torch.float32).to(query.dtype)`). candle's bf16
+            // `softmax_last_dim` accumulates the sum-of-exp in bf16 — the verified cause of the
+            // bf16 degradation (repetition loops); see docs/gemma4-candle-cndl9-findings.md.
+            let attn_weights =
+                candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
+                    .to_dtype(v.dtype())?;
             attn_weights.matmul(&v)?
         };
         attn_output

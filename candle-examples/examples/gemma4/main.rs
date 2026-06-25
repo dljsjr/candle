@@ -212,6 +212,12 @@ struct Args {
     /// Use the slower dmmv cuda kernel.
     #[arg(long)]
     force_dmmv: bool,
+
+    /// Override the compute dtype: "bf16", "f16", or "f32".
+    /// Defaults to bf16 on CUDA, f32 otherwise. Use bf16 to exercise/validate the bf16 path
+    /// (e.g. E2B in ~10 GB on Metal rather than ~20 GB f32).
+    #[arg(long)]
+    dtype: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -275,11 +281,15 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let device = candle_examples::device(args.cpu)?;
-    let dtype = if device.is_cuda() {
-        DType::BF16
-    } else {
-        DType::F32
+    let dtype = match args.dtype.as_deref() {
+        Some("bf16") => DType::BF16,
+        Some("f16") => DType::F16,
+        Some("f32") => DType::F32,
+        Some(other) => return Err(E::msg(format!("unsupported --dtype {other:?}"))),
+        None if device.is_cuda() => DType::BF16,
+        None => DType::F32,
     };
+    println!("compute dtype: {dtype:?}");
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
 
     let model = if args.multimodal {
