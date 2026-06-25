@@ -83,6 +83,14 @@ impl TextGeneration {
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
+        // Gemma expects a leading <bos>; the tokenizer's add_special_tokens isn't prepending it
+        // here, so ensure it (matches transformers' apply_chat_template — required for parity and
+        // correct generation).
+        if let Some(bos) = self.tokenizer.get_token("<bos>") {
+            if tokens.first() != Some(&bos) {
+                tokens.insert(0, bos);
+            }
+        }
         for &t in tokens.iter() {
             if let Some(t) = self.tokenizer.next_token(t)? {
                 print!("{t}")
