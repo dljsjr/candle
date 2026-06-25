@@ -73,7 +73,7 @@ impl TextGeneration {
         }
     }
 
-    fn run(&mut self, prompt: &str, sample_len: usize) -> Result<()> {
+    fn run(&mut self, prompt: &str, sample_len: usize, dump_topk: usize) -> Result<()> {
         use std::io::Write;
         self.tokenizer.clear();
         let mut tokens = self
@@ -110,6 +110,19 @@ impl TextGeneration {
                 ModelKind::Multimodal(m) => m.forward(&input, start_pos)?,
             };
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+            if dump_topk > 0 && index == 0 {
+                // Parity dump: input ids + top-K of the first-position (post-softcap) logits, f32.
+                println!("INPUT_IDS: {ctxt:?}");
+                let v: Vec<f32> = logits.to_vec1()?;
+                let mut order: Vec<usize> = (0..v.len()).collect();
+                order.sort_unstable_by(|&a, &b| v[b].total_cmp(&v[a]));
+                print!("TOPK:");
+                for &i in order.iter().take(dump_topk) {
+                    print!(" {i}:{:.4}", v[i]);
+                }
+                println!();
+                return Ok(());
+            }
             let logits = if self.repeat_penalty == 1. {
                 logits
             } else {
@@ -218,6 +231,11 @@ struct Args {
     /// (e.g. E2B in ~10 GB on Metal rather than ~20 GB f32).
     #[arg(long)]
     dtype: Option<String>,
+
+    /// Parity dump: print the prompt's input ids + the top-K first-position logits (f32), then exit.
+    /// 0 = off (normal generation).
+    #[arg(long, default_value_t = 0)]
+    dump_topk: usize,
 }
 
 fn main() -> Result<()> {
@@ -334,6 +352,6 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    pipeline.run(&args.prompt, args.sample_len)?;
+    pipeline.run(&args.prompt, args.sample_len, args.dump_topk)?;
     Ok(())
 }
