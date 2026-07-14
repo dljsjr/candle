@@ -7,6 +7,10 @@
 //! `layer_scalar`, per-layer head_dim (global vs sliding), proportional rope on global layers,
 //! `final_logit_softcapping`, and a gelu-tanh MLP (NOT silu).
 //!
+//! The dense variants (12B/31B) carry none of the PLE/shared-KV/double-wide machinery but add
+//! `attention_k_eq_v` (global layers have no `attn_v` tensor — V shares K's projection) and a
+//! per-layer `head_count_kv` array. Both shapes load from the same metadata/tensor probing.
+//!
 //! The two embedding tables (`token_embd`, `per_layer_token_embd`) stay packed as `QTensor` and
 //! are looked up via [`QTensor::embedding`] — dequantizing the PLE table (~2.3B params at Q6_K)
 //! would cost ~9 GB in f32 and defeat the point of the quantized model.
@@ -67,7 +71,8 @@ impl Module for Mlp {
     }
 }
 
-/// Per-layer-input (PLE) mixer bits — present on every layer (`inp_gate`/`proj`/`post_norm`).
+/// Per-layer-input (PLE) mixer bits — on E-models, present on every layer (`inp_gate`/`proj`/
+/// `post_norm`); absent on the dense variants (12B/31B).
 #[derive(Debug, Clone)]
 struct PerLayerInput {
     input_gate: QMatMul,
@@ -75,13 +80,24 @@ struct PerLayerInput {
     post_norm: RmsNorm,
 }
 
+/// The PLE model-level pieces (E-models only): the per-layer token-embedding table and the
+/// context-aware projection that together form each layer's per-layer input.
+#[derive(Debug, Clone)]
+struct PerLayerEmbeddings {
+    token_embeddings: Arc<QTensor>, // GGUF `per_layer_token_embd` (packed; rows dequant on lookup)
+    model_projection: QMatMul,      // GGUF `per_layer_model_proj` (F16)
+    projection_norm: RmsNorm,       // GGUF `per_layer_proj_norm`
+    input_dim: usize,               // `embedding_length_per_layer_input` (256 on E-models)
+}
+
 /// On non-shared layers K/V is computed from the layer's own weights; shared layers reuse the
-/// donor layer's K/V (the GGUF doesn't even carry k/v/k_norm for them).
+/// donor layer's K/V (the GGUF doesn't even carry k/v/k_norm for them). `wv: None` is the dense
+/// variants' `attention_k_eq_v` on global layers: no `attn_v` tensor, V shares K's projection.
 #[derive(Debug, Clone)]
 enum KvSource {
     Compute {
         wk: QMatMul,
-        wv: QMatMul,
+        wv: Option<QMatMul>,
         k_norm: RmsNorm,
     },
     Shared,
@@ -153,7 +169,7 @@ struct LayerWeights {
     post_feedforward_layernorm: RmsNorm, // GGUF `post_ffw_norm`
 
     mlp: Mlp,
-    per_layer: PerLayerInput,
+    per_layer: Option<PerLayerInput>,
     layer_scalar: Tensor, // GGUF `layer_output_scale`
 
     n_head: usize,
@@ -193,7 +209,12 @@ impl LayerWeights {
         let (k, v) = match &self.kv {
             KvSource::Compute { wk, wv, k_norm } => {
                 let k = wk.forward(x)?;
-                let v = wv.forward(x)?;
+                // `attention_k_eq_v` (dense variants, global layers): V shares K's projection
+                // output — taken RAW, before k_norm/rope (only v_norm applies), as in the float path.
+                let v = match wv {
+                    Some(wv) => wv.forward(x)?,
+                    None => k.clone(),
+                };
                 let k = k
                     .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
                     .transpose(1, 2)?;
@@ -294,12 +315,9 @@ fn causal_mask(
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
     tok_embeddings: Arc<QTensor>, // GGUF `token_embd` (also the tied output)
-    per_layer_token_embeddings: Arc<QTensor>, // GGUF `per_layer_token_embd` (the PLE table)
-    per_layer_model_projection: QMatMul, // GGUF `per_layer_model_proj` (F16)
-    per_layer_projection_norm: RmsNorm, // GGUF `per_layer_proj_norm`
+    ple: Option<PerLayerEmbeddings>, // E-models only; dense variants (12B/31B) have no PLE
 
     embedding_length: usize,
-    per_layer_input_dim: usize, // `embedding_length_per_layer_input` (256)
     sliding_window: usize,
 
     layers: Vec<LayerWeights>,
@@ -326,10 +344,33 @@ impl ModelWeights {
         };
 
         let head_count = md_get("attention.head_count")?.to_u32()? as usize;
-        let head_count_kv = md_get("attention.head_count_kv")?.to_u32()? as usize;
         let block_count = md_get("block_count")?.to_u32()? as usize;
+        // Scalar on the E-models; a per-layer array on the dense variants (8 sliding / 1 global).
+        // Array elements are written as i32 by the converter, so accept either signedness.
+        let as_count = |x: &gguf_file::Value| -> Result<usize> {
+            match x.to_u32() {
+                Ok(n) => Ok(n as usize),
+                Err(_) => Ok(x.to_i32()? as usize),
+            }
+        };
+        let head_count_kv: Vec<usize> = {
+            let v = md_get("attention.head_count_kv")?;
+            match v.to_vec() {
+                Ok(arr) => arr.iter().map(as_count).collect::<Result<_>>()?,
+                Err(_) => vec![as_count(v)?; block_count],
+            }
+        };
+        if head_count_kv.len() != block_count {
+            candle::bail!(
+                "head_count_kv has {} entries for {block_count} layers",
+                head_count_kv.len()
+            )
+        }
         let embedding_length = md_get("embedding_length")?.to_u32()? as usize;
-        let per_layer_input_dim = md_get("embedding_length_per_layer_input")?.to_u32()? as usize;
+        // 0 (or absent) = no PLE — the dense variants (12B/31B).
+        let per_layer_input_dim = md_get("embedding_length_per_layer_input")
+            .and_then(|v| v.to_u32())
+            .unwrap_or(0) as usize;
         let key_length = md_get("attention.key_length")?.to_u32()? as usize; // 512 (global)
         let key_length_swa = md_get("attention.key_length_swa")?.to_u32()? as usize; // 256 (sliding)
         let shared_kv_layers = md_get("attention.shared_kv_layers")?.to_u32()? as usize;
@@ -363,15 +404,27 @@ impl ModelWeights {
         // --- non-layer tensors ---
         // Both embedding tables stay packed; rows dequantize on lookup via QTensor::embedding.
         let tok_embeddings = Arc::new(ct.tensor(reader, "token_embd.weight", device)?);
-        let per_layer_token_embeddings =
-            Arc::new(ct.tensor(reader, "per_layer_token_embd.weight", device)?);
-
-        let per_layer_model_projection =
-            QMatMul::from_qtensor(ct.tensor(reader, "per_layer_model_proj.weight", device)?)?;
-        let per_layer_projection_norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, "per_layer_proj_norm.weight", device)?,
-            rms_eps,
-        )?;
+        let ple = if per_layer_input_dim > 0 {
+            Some(PerLayerEmbeddings {
+                token_embeddings: Arc::new(ct.tensor(
+                    reader,
+                    "per_layer_token_embd.weight",
+                    device,
+                )?),
+                model_projection: QMatMul::from_qtensor(ct.tensor(
+                    reader,
+                    "per_layer_model_proj.weight",
+                    device,
+                )?)?,
+                projection_norm: RmsNorm::from_qtensor(
+                    ct.tensor(reader, "per_layer_proj_norm.weight", device)?,
+                    rms_eps,
+                )?,
+                input_dim: per_layer_input_dim,
+            })
+        } else {
+            None
+        };
         let norm =
             RmsNorm::from_qtensor(ct.tensor(reader, "output_norm.weight", device)?, rms_eps)?;
         // Tied output (no `output.weight` in the gemma-4 GGUF).
@@ -415,17 +468,21 @@ impl ModelWeights {
             let kv = if is_shared {
                 KvSource::Shared
             } else {
+                // `attention_k_eq_v` layers (dense variants, global attention) carry no attn_v
+                // tensor: detect by presence rather than a config key (the GGUF has none).
+                let v_name = format!("{p}.attn_v.weight");
+                let wv = if ct.tensor_infos.contains_key(&v_name) {
+                    Some(QMatMul::from_qtensor(ct.tensor(reader, &v_name, device)?)?)
+                } else {
+                    None
+                };
                 KvSource::Compute {
                     wk: QMatMul::from_qtensor(ct.tensor(
                         reader,
                         &format!("{p}.attn_k.weight"),
                         device,
                     )?)?,
-                    wv: QMatMul::from_qtensor(ct.tensor(
-                        reader,
-                        &format!("{p}.attn_v.weight"),
-                        device,
-                    )?)?,
+                    wv,
                     k_norm: RmsNorm::from_qtensor(
                         ct.tensor(reader, &format!("{p}.attn_k_norm.weight"), device)?,
                         rms_eps,
@@ -468,21 +525,25 @@ impl ModelWeights {
                 )?)?,
             };
 
-            let per_layer = PerLayerInput {
-                input_gate: QMatMul::from_qtensor(ct.tensor(
-                    reader,
-                    &format!("{p}.inp_gate.weight"),
-                    device,
-                )?)?,
-                projection: QMatMul::from_qtensor(ct.tensor(
-                    reader,
-                    &format!("{p}.proj.weight"),
-                    device,
-                )?)?,
-                post_norm: RmsNorm::from_qtensor(
-                    ct.tensor(reader, &format!("{p}.post_norm.weight"), device)?,
-                    rms_eps,
-                )?,
+            let per_layer = if per_layer_input_dim > 0 {
+                Some(PerLayerInput {
+                    input_gate: QMatMul::from_qtensor(ct.tensor(
+                        reader,
+                        &format!("{p}.inp_gate.weight"),
+                        device,
+                    )?)?,
+                    projection: QMatMul::from_qtensor(ct.tensor(
+                        reader,
+                        &format!("{p}.proj.weight"),
+                        device,
+                    )?)?,
+                    post_norm: RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{p}.post_norm.weight"), device)?,
+                        rms_eps,
+                    )?,
+                })
+            } else {
+                None
             };
             let layer_scalar = ct
                 .tensor(reader, &format!("{p}.layer_output_scale.weight"), device)?
@@ -509,7 +570,7 @@ impl ModelWeights {
                 per_layer,
                 layer_scalar,
                 n_head: head_count,
-                n_kv_head: head_count_kv,
+                n_kv_head: head_count_kv[i],
                 head_dim,
                 rms_eps,
                 is_global,
@@ -523,11 +584,8 @@ impl ModelWeights {
 
         Ok(Self {
             tok_embeddings,
-            per_layer_token_embeddings,
-            per_layer_model_projection,
-            per_layer_projection_norm,
+            ple,
             embedding_length,
-            per_layer_input_dim,
             sliding_window,
             layers,
             norm,
@@ -572,19 +630,25 @@ impl ModelWeights {
         let xs = self.tok_embeddings.embedding(x)?;
         let xs = (xs * (self.embedding_length as f64).sqrt())?;
 
-        // PLE per-layer inputs: (context-aware projection + per-layer token embedding) / sqrt(2),
-        // shaped (b, seq, n_layers, per_layer_input_dim). Mirrors the float forward_embeds.
+        // PLE per-layer inputs (E-models only): (context-aware projection + per-layer token
+        // embedding) / sqrt(2), shaped (b, seq, n_layers, input_dim). Mirrors the float
+        // forward_embeds; None on the dense variants.
         let n_layers = self.layers.len();
-        let per_layer_projection = (self.per_layer_model_projection.forward(&xs)?
-            * (1.0 / (self.embedding_length as f64).sqrt()))?;
-        let per_layer_projection = per_layer_projection
-            .reshape((b_sz, seq_len, n_layers, self.per_layer_input_dim))?
-            .apply(&self.per_layer_projection_norm)?;
-        let per_layer_embeds = (self.per_layer_token_embeddings.embedding(x)?
-            * (self.per_layer_input_dim as f64).sqrt())?
-        .reshape((b_sz, seq_len, n_layers, self.per_layer_input_dim))?;
-        let per_layer_inputs =
-            ((per_layer_projection + per_layer_embeds)? * (1.0 / 2.0f64.sqrt()))?;
+        let per_layer_inputs = self
+            .ple
+            .as_ref()
+            .map(|ple| -> Result<Tensor> {
+                let per_layer_projection = (ple.model_projection.forward(&xs)?
+                    * (1.0 / (self.embedding_length as f64).sqrt()))?;
+                let per_layer_projection = per_layer_projection
+                    .reshape((b_sz, seq_len, n_layers, ple.input_dim))?
+                    .apply(&ple.projection_norm)?;
+                let per_layer_embeds = (ple.token_embeddings.embedding(x)?
+                    * (ple.input_dim as f64).sqrt())?
+                .reshape((b_sz, seq_len, n_layers, ple.input_dim))?;
+                (per_layer_projection + per_layer_embeds)? * (1.0 / 2.0f64.sqrt())
+            })
+            .transpose()?;
 
         let (full_mask, sliding_mask) = self.masks(b_sz, seq_len, index_pos, x.device())?;
 
@@ -612,13 +676,19 @@ impl ModelWeights {
             drop(_mlp_enter);
 
             // PLE mix: gate the hidden state, multiply with this layer's input, project back up.
-            let per_layer_input = per_layer_inputs.get_on_dim(2, i)?;
-            let residual = &xs_mlp;
-            let m = layer.per_layer.input_gate.forward(&xs_mlp)?.gelu()?;
-            let m = (m * per_layer_input)?;
-            let m = layer.per_layer.projection.forward(&m)?;
-            let m = layer.per_layer.post_norm.forward(&m)?;
-            let xs_mixed = (residual + m)?;
+            let xs_mixed = match (&layer.per_layer, &per_layer_inputs) {
+                (Some(per_layer), Some(per_layer_inputs)) => {
+                    let per_layer_input = per_layer_inputs.get_on_dim(2, i)?;
+                    let residual = &xs_mlp;
+                    let m = per_layer.input_gate.forward(&xs_mlp)?.gelu()?;
+                    let m = (m * per_layer_input)?;
+                    let m = per_layer.projection.forward(&m)?;
+                    let m = per_layer.post_norm.forward(&m)?;
+                    (residual + m)?
+                }
+                (None, None) => xs_mlp,
+                _ => candle::bail!("PLE state mismatch between model and layer {i}"),
+            };
 
             xs = xs_mixed.broadcast_mul(&layer.layer_scalar)?;
         }

@@ -17,9 +17,11 @@ use tokenizers::Tokenizer;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Which {
     #[value(name = "gemma4-E2B-it")]
-    Gemma4E2bIt,
+    Gemma4E2b,
     #[value(name = "gemma4-E4B-it")]
-    Gemma4E4bIt,
+    Gemma4E4b,
+    #[value(name = "gemma4-12B-it")]
+    Gemma4_12b,
 }
 
 impl Which {
@@ -27,15 +29,20 @@ impl Which {
     /// carry no tokenizer.json, so it comes from the float repo.
     fn hub_names(&self) -> (&'static str, &'static str, &'static str) {
         match self {
-            Self::Gemma4E2bIt => (
+            Self::Gemma4E2b => (
                 "google/gemma-4-E2B-it-qat-q4_0-gguf",
                 "gemma-4-E2B_q4_0-it.gguf",
                 "google/gemma-4-E2B-it",
             ),
-            Self::Gemma4E4bIt => (
+            Self::Gemma4E4b => (
                 "google/gemma-4-E4B-it-qat-q4_0-gguf",
                 "gemma-4-E4B_q4_0-it.gguf",
                 "google/gemma-4-E4B-it",
+            ),
+            Self::Gemma4_12b => (
+                "google/gemma-4-12B-it-qat-q4_0-gguf",
+                "gemma-4-12b-it-qat-q4_0.gguf",
+                "google/gemma-4-12B-it",
             ),
         }
     }
