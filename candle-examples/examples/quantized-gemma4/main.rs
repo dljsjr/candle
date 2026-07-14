@@ -22,6 +22,8 @@ enum Which {
     Gemma4E4b,
     #[value(name = "gemma4-12B-it")]
     Gemma4_12b,
+    #[value(name = "gemma4-31B-it")]
+    Gemma4_31b,
 }
 
 impl Which {
@@ -43,6 +45,11 @@ impl Which {
                 "google/gemma-4-12B-it-qat-q4_0-gguf",
                 "gemma-4-12b-it-qat-q4_0.gguf",
                 "google/gemma-4-12B-it",
+            ),
+            Self::Gemma4_31b => (
+                "google/gemma-4-31B-it-qat-q4_0-gguf",
+                "gemma-4-31B_q4_0-it.gguf",
+                "google/gemma-4-31B-it",
             ),
         }
     }
