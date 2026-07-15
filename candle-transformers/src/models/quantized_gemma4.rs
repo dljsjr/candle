@@ -59,20 +59,60 @@ impl QMatMul {
     }
 }
 
+/// Row-concatenate 2-D quantized tensors sharing dtype and column count into ONE QTensor —
+/// block quantization is row-contiguous, so stacking rows is a raw byte append (the inverse of
+/// `split_experts`). One GEMV instead of N per forward; the outputs split back by `narrow`.
+/// Returns `None` when the tensors aren't uniform (caller keeps the split projections).
+fn fuse_rows(ts: &[&QTensor], device: &Device) -> Result<Option<QTensor>> {
+    let dtype = ts[0].dtype();
+    let dims = ts[0].shape().dims();
+    if dims.len() != 2 {
+        return Ok(None);
+    }
+    let cols = dims[1];
+    let mut rows = 0;
+    let mut data: Vec<u8> = Vec::new();
+    for t in ts {
+        let d = t.shape().dims();
+        if t.dtype() != dtype || d.len() != 2 || d[1] != cols {
+            return Ok(None);
+        }
+        rows += d[0];
+        data.extend_from_slice(&t.data()?);
+    }
+    let storage = QStorage::from_data(Cow::Owned(data), device, dtype)?;
+    Ok(Some(QTensor::new(storage, (rows, cols))?))
+}
+
+/// The MLP's gate/up projections: row-fused into one GEMV when the GGUF tensors are uniform.
+#[derive(Debug, Clone)]
+enum GateUp {
+    Fused { gate_up: QMatMul, inter: usize },
+    Split { gate: QMatMul, up: QMatMul },
+}
+
 /// SwiGLU-style MLP but with **gelu_pytorch_tanh** (the gemma activation); `quantized_gemma3`'s
 /// template uses silu, which is wrong for gemma-4. Double-wide on shared layers is implicit in
 /// the loaded tensor shapes.
 #[derive(Debug, Clone)]
 struct Mlp {
-    gate: QMatMul,
-    up: QMatMul,
+    gate_up: GateUp,
     down: QMatMul,
 }
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(xs)?.gelu()?; // candle's gelu() is the tanh approximation
-        let up = self.up.forward(xs)?;
+        let (gate, up) = match &self.gate_up {
+            GateUp::Fused { gate_up, inter } => {
+                let y = gate_up.forward(xs)?;
+                (
+                    y.narrow(candle::D::Minus1, 0, *inter)?,
+                    y.narrow(candle::D::Minus1, *inter, *inter)?,
+                )
+            }
+            GateUp::Split { gate, up } => (gate.forward(xs)?, up.forward(xs)?),
+        };
+        let gate = gate.gelu()?; // candle's gelu() is the tanh approximation
         self.down.forward(&(gate * up)?)
     }
 }
@@ -96,16 +136,20 @@ struct PerLayerEmbeddings {
     input_dim: usize,               // `embedding_length_per_layer_input` (256 on E-models)
 }
 
+/// The K/V projections of a non-shared layer: row-fused into one GEMV when the GGUF tensors are
+/// uniform. `Split { wv: None }` is the dense variants' `attention_k_eq_v` on global layers: no
+/// `attn_v` tensor, V shares K's projection.
+#[derive(Debug, Clone)]
+enum KvProj {
+    Fused { wkv: QMatMul, k_rows: usize },
+    Split { wk: QMatMul, wv: Option<QMatMul> },
+}
+
 /// On non-shared layers K/V is computed from the layer's own weights; shared layers reuse the
-/// donor layer's K/V (the GGUF doesn't even carry k/v/k_norm for them). `wv: None` is the dense
-/// variants' `attention_k_eq_v` on global layers: no `attn_v` tensor, V shares K's projection.
+/// donor layer's K/V (the GGUF doesn't even carry k/v/k_norm for them).
 #[derive(Debug, Clone)]
 enum KvSource {
-    Compute {
-        wk: QMatMul,
-        wv: Option<QMatMul>,
-        k_norm: RmsNorm,
-    },
+    Compute { proj: KvProj, k_norm: RmsNorm },
     Shared,
 }
 
@@ -225,12 +269,19 @@ struct MoeBlock {
 }
 
 /// Pure RMS normalization without learned weight (used for V norm), as in the float path.
+/// Composed ops (5 kernels) — the layer hot path uses the fused kernel via `v_norm_fused`.
 fn v_norm(v: &Tensor, eps: f64) -> Result<Tensor> {
     let original_dtype = v.dtype();
     let v_f32 = v.to_dtype(DType::F32)?;
     let mean_sq = v_f32.sqr()?.mean_keepdim(candle::D::Minus1)?;
     let rms = (mean_sq + eps)?.sqrt()?;
     v_f32.broadcast_div(&rms)?.to_dtype(original_dtype)
+}
+
+/// `v_norm` as one fused kernel: `rms_norm` with a unit weight (`ones`, cached per layer) is the
+/// same math — x / sqrt(mean(x²) + eps) — in a single dispatch instead of five.
+fn v_norm_fused(v: &Tensor, ones: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_nn::ops::rms_norm(&v.contiguous()?, ones, eps as f32)
 }
 
 /// One sin/cos table serving both rope variants: `rope_angles == half_dim` is the standard rope
@@ -297,7 +348,8 @@ struct LayerWeights {
     /// This layer is the last non-shared layer of its type: stash its K/V for the shared layers.
     store_shared_kv: bool,
 
-    rotary: RotaryEmbedding,
+    /// Unit weight for the fused V-norm kernel (shape `head_dim`).
+    v_norm_ones: Tensor,
 
     span_attn: tracing::Span,
     span_mlp: tracing::Span,
@@ -308,29 +360,42 @@ impl LayerWeights {
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
-        index_pos: usize,
+        cos_sin: &(Tensor, Tensor),
         cache_slot: &mut Option<(Tensor, Tensor)>,
         shared_kv_states: &mut SharedKvStates,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
+        let (cos, sin) = cos_sin;
 
         let q = self.wq.forward(x)?;
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
             .transpose(1, 2)?;
         let q = self.q_norm.forward(&q.contiguous()?)?;
-        let (cos, sin) = self.rotary.cos_sin(index_pos, seq_len)?;
-        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
 
         let (k, v) = match &self.kv {
-            KvSource::Compute { wk, wv, k_norm } => {
-                let k = wk.forward(x)?;
-                // `attention_k_eq_v` (dense variants, global layers): V shares K's projection
-                // output — taken RAW, before k_norm/rope (only v_norm applies), as in the float path.
-                let v = match wv {
-                    Some(wv) => wv.forward(x)?,
-                    None => k.clone(),
+            KvSource::Compute { proj, k_norm } => {
+                let (k, v) = match proj {
+                    KvProj::Fused { wkv, k_rows } => {
+                        let y = wkv.forward(x)?;
+                        let v_rows = y.dim(candle::D::Minus1)? - k_rows;
+                        (
+                            y.narrow(candle::D::Minus1, 0, *k_rows)?.contiguous()?,
+                            y.narrow(candle::D::Minus1, *k_rows, v_rows)?.contiguous()?,
+                        )
+                    }
+                    // `attention_k_eq_v` (dense variants, global layers): V shares K's projection
+                    // output — RAW, before k_norm/rope (only v_norm applies), as in the float path.
+                    KvProj::Split { wk, wv } => {
+                        let k = wk.forward(x)?;
+                        let v = match wv {
+                            Some(wv) => wv.forward(x)?,
+                            None => k.clone(),
+                        };
+                        (k, v)
+                    }
                 };
                 let k = k
                     .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
@@ -339,9 +404,9 @@ impl LayerWeights {
                     .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
                     .transpose(1, 2)?;
                 let k = k_norm.forward(&k.contiguous()?)?;
-                let k = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
-                // V norm (RMS without learned weight)
-                let v = v_norm(&v, self.rms_eps)?;
+                let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
+                // V norm (RMS without learned weight), as one fused kernel.
+                let v = v_norm_fused(&v, &self.v_norm_ones, self.rms_eps)?;
 
                 let (k, v) = match cache_slot.as_ref() {
                     Some((k_cache, v_cache)) => {
@@ -525,6 +590,10 @@ pub struct ModelWeights {
 
     embedding_length: usize,
     sliding_window: usize,
+    /// One rope table per layer type; the per-step `(cos, sin)` pair is narrowed ONCE per forward
+    /// (not per layer) and shared by every layer of that type.
+    rotary_global: RotaryEmbedding,
+    rotary_sliding: RotaryEmbedding,
 
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
@@ -689,19 +758,28 @@ impl ModelWeights {
             } else {
                 // `attention_k_eq_v` layers (dense variants, global attention) carry no attn_v
                 // tensor: detect by presence rather than a config key (the GGUF has none).
+                let k_t = ct.tensor(reader, &format!("{p}.attn_k.weight"), device)?;
                 let v_name = format!("{p}.attn_v.weight");
-                let wv = if ct.tensor_infos.contains_key(&v_name) {
-                    Some(QMatMul::from_qtensor(ct.tensor(reader, &v_name, device)?)?)
+                let proj = if ct.tensor_infos.contains_key(&v_name) {
+                    let v_t = ct.tensor(reader, &v_name, device)?;
+                    match fuse_rows(&[&k_t, &v_t], device)? {
+                        Some(f) => KvProj::Fused {
+                            k_rows: k_t.shape().dims()[0],
+                            wkv: QMatMul::from_qtensor(f)?,
+                        },
+                        None => KvProj::Split {
+                            wk: QMatMul::from_qtensor(k_t)?,
+                            wv: Some(QMatMul::from_qtensor(v_t)?),
+                        },
+                    }
                 } else {
-                    None
+                    KvProj::Split {
+                        wk: QMatMul::from_qtensor(k_t)?,
+                        wv: None,
+                    }
                 };
                 KvSource::Compute {
-                    wk: QMatMul::from_qtensor(ct.tensor(
-                        reader,
-                        &format!("{p}.attn_k.weight"),
-                        device,
-                    )?)?,
-                    wv,
+                    proj,
                     k_norm: RmsNorm::from_qtensor(
                         ct.tensor(reader, &format!("{p}.attn_k_norm.weight"), device)?,
                         rms_eps,
@@ -726,17 +804,20 @@ impl ModelWeights {
                 rms_eps,
             )?;
 
+            let gate_t = ct.tensor(reader, &format!("{p}.ffn_gate.weight"), device)?;
+            let up_t = ct.tensor(reader, &format!("{p}.ffn_up.weight"), device)?;
+            let gate_up = match fuse_rows(&[&gate_t, &up_t], device)? {
+                Some(f) => GateUp::Fused {
+                    inter: gate_t.shape().dims()[0],
+                    gate_up: QMatMul::from_qtensor(f)?,
+                },
+                None => GateUp::Split {
+                    gate: QMatMul::from_qtensor(gate_t)?,
+                    up: QMatMul::from_qtensor(up_t)?,
+                },
+            };
             let mlp = Mlp {
-                gate: QMatMul::from_qtensor(ct.tensor(
-                    reader,
-                    &format!("{p}.ffn_gate.weight"),
-                    device,
-                )?)?,
-                up: QMatMul::from_qtensor(ct.tensor(
-                    reader,
-                    &format!("{p}.ffn_up.weight"),
-                    device,
-                )?)?,
+                gate_up,
                 down: QMatMul::from_qtensor(ct.tensor(
                     reader,
                     &format!("{p}.ffn_down.weight"),
@@ -818,11 +899,6 @@ impl ModelWeights {
                 None
             };
 
-            let rotary = if is_global {
-                rotary_global.clone()
-            } else {
-                rotary_sliding.clone()
-            };
             let store_shared_kv =
                 shared_kv_layers > 0 && (Some(i) == donor_full || Some(i) == donor_sliding);
 
@@ -846,7 +922,7 @@ impl ModelWeights {
                 is_global,
                 window: (!is_global).then_some(sliding_window),
                 store_shared_kv,
-                rotary,
+                v_norm_ones: Tensor::ones(head_dim, DType::F32, device)?,
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                 span_mlp: tracing::span!(tracing::Level::TRACE, "attn-mlp"),
             });
@@ -857,6 +933,8 @@ impl ModelWeights {
             ple,
             embedding_length,
             sliding_window,
+            rotary_global,
+            rotary_sliding,
             layers,
             norm,
             output,
@@ -968,6 +1046,9 @@ impl ModelWeights {
             .transpose()?;
 
         let (full_mask, sliding_mask) = self.masks(b_sz, seq_len, index_pos, x.device())?;
+        // One (cos, sin) narrow per layer TYPE per forward, shared by all its layers.
+        let cs_global = self.rotary_global.cos_sin(index_pos, seq_len)?;
+        let cs_sliding = self.rotary_sliding.cos_sin(index_pos, seq_len)?;
 
         let mut shared_kv_states = SharedKvStates::default();
         let mut xs = xs;
@@ -977,15 +1058,15 @@ impl ModelWeights {
             .zip(cache.layers.iter_mut())
             .enumerate()
         {
-            let mask = if layer.is_global {
-                full_mask.as_ref()
+            let (mask, cos_sin) = if layer.is_global {
+                (full_mask.as_ref(), &cs_global)
             } else {
-                sliding_mask.as_ref()
+                (sliding_mask.as_ref(), &cs_sliding)
             };
 
             let residual = &xs;
             let x1 = layer.input_layernorm.forward(&xs)?;
-            let x1 = layer.forward_attn(&x1, mask, index_pos, cache_slot, &mut shared_kv_states)?;
+            let x1 = layer.forward_attn(&x1, mask, cos_sin, cache_slot, &mut shared_kv_states)?;
             let x1 = layer.post_attention_layernorm.forward(&x1)?;
             let xs_attn = (x1 + residual)?;
 
