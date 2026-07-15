@@ -20,9 +20,10 @@
 
 use crate::quantized_nn::RmsNorm;
 use candle::quantized::gguf_file;
-use candle::quantized::QTensor;
+use candle::quantized::{QStorage, QTensor};
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::Module;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 const MAX_SEQ_LEN: usize = 131072;
@@ -111,6 +112,113 @@ struct SharedKvStates {
     for_sliding: Option<(Tensor, Tensor)>,
 }
 
+// ── MoE (26B-A4B) — mirrors the float `gemma4::text` MoE, quantized ────────────────────────────
+
+/// Split a stacked-expert 3D `QTensor` `[E, rows, cols]` into one `QMatMul` per expert. Block
+/// quantization is row-contiguous, so each expert is a contiguous slice of the raw bytes; the
+/// experts stay packed (dequantizing the 26B's expert slabs would cost ~60 GB f32). The CUDA-only
+/// `moe_gemm_gguf`/`indexed_moe_forward` primitives can replace this on GPU later.
+fn split_experts(t: &QTensor, device: &Device) -> Result<Vec<QMatMul>> {
+    let (num_experts, rows, cols) = t.shape().dims3()?;
+    let dtype = t.dtype();
+    let data = t.data()?;
+    if !data.len().is_multiple_of(num_experts) {
+        candle::bail!(
+            "expert tensor bytes ({}) not divisible by expert count ({num_experts})",
+            data.len()
+        )
+    }
+    let bytes_per_expert = data.len() / num_experts;
+    (0..num_experts)
+        .map(|e| {
+            let slice = &data[e * bytes_per_expert..(e + 1) * bytes_per_expert];
+            let storage = QStorage::from_data(Cow::Borrowed(slice), device, dtype)?;
+            QMatMul::from_qtensor(QTensor::new(storage, (rows, cols))?)
+        })
+        .collect()
+}
+
+/// Expert router: weightless RMS norm → per-dim scale → `hidden^-0.5` → scores → f32 softmax →
+/// top-k → renormalize → per-expert scale. Top-k selection runs host-side (E=128, n small).
+/// GGUF mapping: proj = `ffn_gate_inp.weight` [E, H] (F32), scale = `ffn_gate_inp.scale` [H],
+/// per-expert scale = `ffn_down_exps.scale` [E].
+#[derive(Debug, Clone)]
+struct Router {
+    proj: Tensor,  // [num_experts, hidden] f32
+    scale: Tensor, // [hidden] f32
+    per_expert_scale: Vec<f32>,
+    eps: f64,
+    hidden_size: usize,
+    top_k: usize,
+}
+
+impl Router {
+    /// `xs`: flat `[n, hidden]`. Returns `n` vecs of `top_k` `(expert, weight)` picks.
+    fn forward(&self, xs: &Tensor) -> Result<Vec<Vec<(usize, f32)>>> {
+        let h = v_norm(xs, self.eps)?;
+        let h = h.broadcast_mul(&self.scale)?;
+        let h = (h * (self.hidden_size as f64).powf(-0.5))?;
+        let scores = h.matmul(&self.proj.t()?)?.to_dtype(DType::F32)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs: Vec<Vec<f32>> = probs.to_vec2()?;
+        Ok(probs
+            .iter()
+            .map(|row| {
+                let mut order: Vec<usize> = (0..row.len()).collect();
+                order.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
+                let top = &order[..self.top_k];
+                let sum: f32 = top.iter().map(|&e| row[e]).sum();
+                top.iter()
+                    .map(|&e| (e, row[e] / sum * self.per_expert_scale[e]))
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+/// Per-expert weights: `gate_up[e]` `[2I, H]` (gate/up fused; output chunks in half) and
+/// `down[e]` `[H, I]`. Per-token top-k loop — fine for one-shot validation and 1-token decode.
+#[derive(Debug, Clone)]
+struct Experts {
+    gate_up: Vec<QMatMul>,
+    down: Vec<QMatMul>,
+}
+
+impl Experts {
+    fn forward(&self, xs: &Tensor, routes: &[Vec<(usize, f32)>]) -> Result<Tensor> {
+        let mut out_rows = Vec::with_capacity(routes.len());
+        for (n, picks) in routes.iter().enumerate() {
+            let x = xs.narrow(0, n, 1)?; // [1, hidden]
+            let mut acc: Option<Tensor> = None;
+            for &(e, w) in picks {
+                let y = self.gate_up[e].forward(&x)?; // [1, 2I]
+                let i = y.dim(1)? / 2;
+                let gate = y.narrow(1, 0, i)?.gelu()?;
+                let up = y.narrow(1, i, i)?;
+                let z = self.down[e].forward(&(gate * up)?)?; // [1, hidden]
+                let z = (z * w as f64)?;
+                acc = Some(match acc {
+                    None => z,
+                    Some(a) => (a + z)?,
+                });
+            }
+            out_rows.push(acc.expect("top_k >= 1"));
+        }
+        Tensor::cat(&out_rows, 0)
+    }
+}
+
+/// The MoE runs in PARALLEL with the dense MLP, both fed from the pre-MLP residual:
+/// `post_ffw_norm_1(mlp) + post_ffw_norm_2(experts(pre_ffw_norm_2(residual)))`.
+#[derive(Debug, Clone)]
+struct MoeBlock {
+    router: Router,
+    experts: Experts,
+    post_ffw_norm_1: RmsNorm,
+    post_ffw_norm_2: RmsNorm,
+    pre_ffw_norm_2: RmsNorm,
+}
+
 /// Pure RMS normalization without learned weight (used for V norm), as in the float path.
 fn v_norm(v: &Tensor, eps: f64) -> Result<Tensor> {
     let original_dtype = v.dtype();
@@ -169,6 +277,7 @@ struct LayerWeights {
     post_feedforward_layernorm: RmsNorm, // GGUF `post_ffw_norm`
 
     mlp: Mlp,
+    moe: Option<MoeBlock>,
     per_layer: Option<PerLayerInput>,
     layer_scalar: Tensor, // GGUF `layer_output_scale`
 
@@ -371,6 +480,15 @@ impl ModelWeights {
         let per_layer_input_dim = md_get("embedding_length_per_layer_input")
             .and_then(|v| v.to_u32())
             .unwrap_or(0) as usize;
+        // MoE (26B-A4B): expert metadata present = MoE model.
+        let num_experts = md_get("expert_count")
+            .and_then(|v| v.to_u32())
+            .ok()
+            .map(|v| v as usize);
+        let top_k_experts = md_get("expert_used_count")
+            .and_then(|v| v.to_u32())
+            .ok()
+            .map(|v| v as usize);
         let key_length = md_get("attention.key_length")?.to_u32()? as usize; // 512 (global)
         let key_length_swa = md_get("attention.key_length_swa")?.to_u32()? as usize; // 256 (sliding)
         let shared_kv_layers = md_get("attention.shared_kv_layers")?.to_u32()? as usize;
@@ -549,6 +667,56 @@ impl ModelWeights {
                 .tensor(reader, &format!("{p}.layer_output_scale.weight"), device)?
                 .dequantize(device)?;
 
+            let moe = if let (Some(num_experts), Some(top_k)) = (num_experts, top_k_experts) {
+                let gate_up_3d =
+                    ct.tensor(reader, &format!("{p}.ffn_gate_up_exps.weight"), device)?;
+                let down_3d = ct.tensor(reader, &format!("{p}.ffn_down_exps.weight"), device)?;
+                let proj = ct
+                    .tensor(reader, &format!("{p}.ffn_gate_inp.weight"), device)?
+                    .dequantize(device)?;
+                let scale = ct
+                    .tensor(reader, &format!("{p}.ffn_gate_inp.scale"), device)?
+                    .dequantize(device)?;
+                let per_expert_scale = ct
+                    .tensor(reader, &format!("{p}.ffn_down_exps.scale"), device)?
+                    .dequantize(device)?
+                    .to_vec1::<f32>()?;
+                if per_expert_scale.len() != num_experts {
+                    candle::bail!(
+                        "per-expert scale has {} entries for {num_experts} experts",
+                        per_expert_scale.len()
+                    )
+                }
+                Some(MoeBlock {
+                    router: Router {
+                        proj,
+                        scale,
+                        per_expert_scale,
+                        eps: rms_eps,
+                        hidden_size: embedding_length,
+                        top_k,
+                    },
+                    experts: Experts {
+                        gate_up: split_experts(&gate_up_3d, device)?,
+                        down: split_experts(&down_3d, device)?,
+                    },
+                    post_ffw_norm_1: RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{p}.post_ffw_norm_1.weight"), device)?,
+                        rms_eps,
+                    )?,
+                    post_ffw_norm_2: RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{p}.post_ffw_norm_2.weight"), device)?,
+                        rms_eps,
+                    )?,
+                    pre_ffw_norm_2: RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{p}.pre_ffw_norm_2.weight"), device)?,
+                        rms_eps,
+                    )?,
+                })
+            } else {
+                None
+            };
+
             let rotary = if is_global {
                 rotary_global.clone()
             } else {
@@ -567,6 +735,7 @@ impl ModelWeights {
                 pre_feedforward_layernorm,
                 post_feedforward_layernorm,
                 mlp,
+                moe,
                 per_layer,
                 layer_scalar,
                 n_head: head_count,
@@ -671,6 +840,21 @@ impl ModelWeights {
             let residual = &xs_attn;
             let x2 = layer.pre_feedforward_layernorm.forward(&xs_attn)?;
             let x2 = layer.mlp.forward(&x2)?;
+            // MoE runs in parallel with the dense MLP, both branches fed from the pre-MLP
+            // residual, combined before the shared post-feedforward norm.
+            let x2 = match &layer.moe {
+                None => x2,
+                Some(moe) => {
+                    let h1 = moe.post_ffw_norm_1.forward(&x2)?;
+                    let flat = residual.reshape((b_sz * seq_len, self.embedding_length))?;
+                    let routes = moe.router.forward(&flat)?;
+                    let h2 = moe.pre_ffw_norm_2.forward(&flat)?;
+                    let h2 = moe.experts.forward(&h2, &routes)?;
+                    let h2 = h2.reshape((b_sz, seq_len, self.embedding_length))?;
+                    let h2 = moe.post_ffw_norm_2.forward(&h2)?;
+                    (h1 + h2)?
+                }
+            };
             let x2 = layer.post_feedforward_layernorm.forward(&x2)?;
             let xs_mlp = (residual + x2)?;
             drop(_mlp_enter);
