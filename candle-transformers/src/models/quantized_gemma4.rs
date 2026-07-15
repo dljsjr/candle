@@ -389,13 +389,35 @@ impl LayerWeights {
             }
         };
 
-        let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?.contiguous()?;
-        let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?.contiguous()?;
+        // Grouped-query attention WITHOUT materializing repeated K/V: fold the query-head groups
+        // into the row dimension — `(b, h, t, d) -> (b, kv, g·t, d)` (head order is kv-major, the
+        // same layout `repeat_kv` produced) — and batch the attention matmuls per KV head. Same
+        // dot products as the repeat_kv path, none of its per-token copy traffic. The mask tiles
+        // its rows g× to match (decode steps pass no mask at all).
+        let groups = self.n_head / self.n_kv_head;
+        let (q, mask_t) = if groups == 1 {
+            (q, mask.cloned())
+        } else {
+            let q = q.reshape((b_sz, self.n_kv_head, groups * seq_len, self.head_dim))?;
+            let mask_t = match mask {
+                None => None,
+                Some(m) => {
+                    let kv_len = m.dim(3)?;
+                    Some(
+                        m.unsqueeze(2)?
+                            .broadcast_as((b_sz, 1, groups, seq_len, kv_len))?
+                            .contiguous()?
+                            .reshape((b_sz, 1, groups * seq_len, kv_len))?,
+                    )
+                }
+            };
+            (q, mask_t)
+        };
 
         // No 1/sqrt(head_dim) scaling: gemma-4 q/k-norms make it superfluous and the reference
         // uses scale 1.0 (parity-validated in the float path).
         let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
-        let attn_weights = match mask {
+        let attn_weights = match &mask_t {
             None => attn_weights,
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
@@ -405,10 +427,10 @@ impl LayerWeights {
             .to_dtype(v.dtype())?;
         let attn_output = attn_weights.matmul(&v)?;
 
-        let attn_output =
-            attn_output
-                .transpose(1, 2)?
-                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+        let attn_output = attn_output
+            .reshape((b_sz, self.n_head, seq_len, self.head_dim))?
+            .transpose(1, 2)?
+            .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
         self.wo.forward(&attn_output)
     }
 }
