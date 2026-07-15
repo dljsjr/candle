@@ -473,6 +473,151 @@ impl Attention {
     }
 }
 
+// ── MoE (26B-A4B) ───────────────────────────────────────────────────────────
+
+/// Expert router: weightless RMS norm → learned per-dim scale → `hidden^-0.5` → linear scores →
+/// f32 softmax → top-k → renormalize to sum 1 → per-expert scale. Top-k selection runs host-side
+/// (E is small; N is the prompt length or 1), returning per-token `(expert, weight)` picks.
+#[derive(Debug, Clone)]
+struct Router {
+    proj: Linear,
+    scale: Tensor,            // [hidden]
+    per_expert_scale: Tensor, // [num_experts]
+    eps: f64,
+    hidden_size: usize,
+    top_k: usize,
+}
+
+impl Router {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        let num_experts = cfg
+            .num_experts
+            .ok_or_else(|| candle::Error::Msg("enable_moe_block requires num_experts".into()))?;
+        let top_k = cfg
+            .top_k_experts
+            .ok_or_else(|| candle::Error::Msg("enable_moe_block requires top_k_experts".into()))?;
+        Ok(Self {
+            proj: candle_nn::linear_no_bias(cfg.hidden_size, num_experts, vb.pp("proj"))?,
+            scale: vb.get(cfg.hidden_size, "scale")?,
+            per_expert_scale: vb.get(num_experts, "per_expert_scale")?,
+            eps: cfg.rms_norm_eps,
+            hidden_size: cfg.hidden_size,
+            top_k,
+        })
+    }
+
+    /// `xs`: flat `[n, hidden]`. Returns `n` vecs of `top_k` `(expert, weight)` picks.
+    fn forward(&self, xs: &Tensor) -> Result<Vec<Vec<(usize, f32)>>> {
+        let h = v_norm(xs, self.eps)?; // RMS norm without learned weight (with_scale=False)
+        let h = h.broadcast_mul(&self.scale.to_dtype(h.dtype())?)?;
+        let h = (h * (self.hidden_size as f64).powf(-0.5))?;
+        let scores = self.proj.forward(&h)?.to_dtype(DType::F32)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs: Vec<Vec<f32>> = probs.to_vec2()?;
+        let pes: Vec<f32> = self.per_expert_scale.to_dtype(DType::F32)?.to_vec1()?;
+        Ok(probs
+            .iter()
+            .map(|row| {
+                let mut order: Vec<usize> = (0..row.len()).collect();
+                order.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]));
+                let top = &order[..self.top_k];
+                let sum: f32 = top.iter().map(|&e| row[e]).sum();
+                top.iter().map(|&e| (e, row[e] / sum * pes[e])).collect()
+            })
+            .collect())
+    }
+}
+
+/// Expert weights as 3D tensors: `gate_up_proj [E, 2*I, H]` (gate and up fused; output chunks in
+/// half) and `down_proj [E, H, I]`. The forward loops per token over its top-k experts — O(n·k)
+/// small matmuls, plenty for one-shot validation and single-token decode; batched-expert kernels
+/// are a later optimization.
+#[derive(Debug, Clone)]
+struct Experts {
+    gate_up: Tensor, // [num_experts, 2 * moe_intermediate, hidden]
+    down: Tensor,    // [num_experts, hidden, moe_intermediate]
+    act: Activation,
+}
+
+impl Experts {
+    /// `xs`: flat `[n, hidden]` (already pre-norm'd); `routes[n]` = that token's picks.
+    fn forward(&self, xs: &Tensor, routes: &[Vec<(usize, f32)>]) -> Result<Tensor> {
+        let mut out_rows = Vec::with_capacity(routes.len());
+        for (n, picks) in routes.iter().enumerate() {
+            let x = xs.narrow(0, n, 1)?; // [1, hidden]
+            let mut acc: Option<Tensor> = None;
+            for &(e, w) in picks {
+                let gate_up = self.gate_up.get(e)?; // [2I, H]
+                let y = x.matmul(&gate_up.t()?)?; // [1, 2I]
+                let i = y.dim(1)? / 2;
+                let gate = y.narrow(1, 0, i)?;
+                let up = y.narrow(1, i, i)?;
+                let h = (gate.apply(&self.act)? * up)?; // [1, I]
+                let z = h.matmul(&self.down.get(e)?.t()?)?; // [1, H]
+                let z = (z * w as f64)?;
+                acc = Some(match acc {
+                    None => z,
+                    Some(a) => (a + z)?,
+                });
+            }
+            out_rows.push(acc.expect("top_k_experts >= 1"));
+        }
+        Tensor::cat(&out_rows, 0)
+    }
+}
+
+/// The whole MoE addition: runs in PARALLEL with the dense MLP (not instead of it) —
+/// `post_ffw_norm_1(mlp_out) + post_ffw_norm_2(experts(pre_ffw_norm_2(pre-MLP residual)))`,
+/// with the router also fed the pre-MLP residual.
+#[derive(Debug, Clone)]
+struct MoeBlock {
+    router: Router,
+    experts: Experts,
+    post_feedforward_layernorm_1: RmsNorm,
+    post_feedforward_layernorm_2: RmsNorm,
+    pre_feedforward_layernorm_2: RmsNorm,
+}
+
+impl MoeBlock {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        let num_experts = cfg
+            .num_experts
+            .ok_or_else(|| candle::Error::Msg("enable_moe_block requires num_experts".into()))?;
+        let moe_intermediate = cfg.moe_intermediate_size.ok_or_else(|| {
+            candle::Error::Msg("enable_moe_block requires moe_intermediate_size".into())
+        })?;
+        Ok(Self {
+            router: Router::new(cfg, vb.pp("router"))?,
+            experts: Experts {
+                gate_up: vb.get(
+                    (num_experts, 2 * moe_intermediate, cfg.hidden_size),
+                    "experts.gate_up_proj",
+                )?,
+                down: vb.get(
+                    (num_experts, cfg.hidden_size, moe_intermediate),
+                    "experts.down_proj",
+                )?,
+                act: cfg.hidden_activation,
+            },
+            post_feedforward_layernorm_1: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_feedforward_layernorm_1"),
+            )?,
+            post_feedforward_layernorm_2: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_feedforward_layernorm_2"),
+            )?,
+            pre_feedforward_layernorm_2: RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("pre_feedforward_layernorm_2"),
+            )?,
+        })
+    }
+}
+
 // ── DecoderLayer ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -489,6 +634,7 @@ struct DecoderLayer {
     layer_scalar: Tensor,
 
     pli_mixer: Option<PerLayerInputMixer>,
+    moe: Option<MoeBlock>,
 }
 
 // FIXME(eddyb) where should this be placed? should fields have `per_layer`?
@@ -585,6 +731,11 @@ impl DecoderLayer {
             layer_scalar: vb.get(1, "layer_scalar")?,
 
             pli_mixer,
+            moe: if cfg.enable_moe_block {
+                Some(MoeBlock::new(cfg, vb)?)
+            } else {
+                None
+            },
         })
     }
 
@@ -612,6 +763,23 @@ impl DecoderLayer {
         let residual = &xs;
         let xs = xs.apply(&self.pre_feedforward_layernorm)?;
         let xs = xs.apply(&self.mlp)?;
+        // MoE runs in parallel with the dense MLP, both branches fed from the pre-MLP residual,
+        // combined before the shared post-feedforward norm.
+        let xs = match &self.moe {
+            None => xs,
+            Some(moe) => {
+                let h1 = xs.apply(&moe.post_feedforward_layernorm_1)?;
+                let (b, s, hidden) = residual.dims3()?;
+                let flat = residual.reshape((b * s, hidden))?;
+                let routes = moe.router.forward(&flat)?;
+                let h2 = flat.apply(&moe.pre_feedforward_layernorm_2)?;
+                let h2 = moe.experts.forward(&h2, &routes)?;
+                let h2 = h2
+                    .reshape((b, s, hidden))?
+                    .apply(&moe.post_feedforward_layernorm_2)?;
+                (h1 + h2)?
+            }
+        };
         let xs = xs.apply(&self.post_feedforward_layernorm)?;
         let xs = (residual + xs)?;
 

@@ -122,6 +122,13 @@ pub struct Gemma4TextConfig {
     pub num_kv_shared_layers: usize,
     #[serde(default)]
     pub use_double_wide_mlp: bool,
+
+    // MoE (26B-A4B): a routed-experts block runs in PARALLEL with the dense MLP on every layer.
+    #[serde(default)]
+    pub enable_moe_block: bool,
+    pub num_experts: Option<usize>,
+    pub top_k_experts: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
 }
 
 impl Gemma4TextConfig {
