@@ -291,6 +291,9 @@ struct LayerWeights {
     head_dim: usize,
     rms_eps: f64,
     is_global: bool,
+    /// iSWA ring bound for sliding layers (`None` on global layers): the cache lane retains only
+    /// the last `window` positions, since the model defines these layers to attend nothing older.
+    window: Option<usize>,
     /// This layer is the last non-shared layer of its type: stash its K/V for the shared layers.
     store_shared_kv: bool,
 
@@ -348,7 +351,20 @@ impl LayerWeights {
                     }
                     None => (k, v),
                 };
-                *cache_slot = Some((k.clone(), v.clone()));
+                // iSWA ring: retain only the last `window` positions on sliding layers — a query
+                // at position q attends the cached q-w..q-1 plus itself, exactly the set the
+                // additive mask admits, so every dropped position was already masked for all
+                // future queries. Global layers retain everything.
+                *cache_slot = Some(match self.window {
+                    Some(w) if k.dim(2)? > w => {
+                        let len = k.dim(2)?;
+                        (
+                            k.narrow(2, len - w, w)?.contiguous()?,
+                            v.narrow(2, len - w, w)?.contiguous()?,
+                        )
+                    }
+                    _ => (k.clone(), v.clone()),
+                });
 
                 if self.store_shared_kv {
                     let kv = (k.clone(), v.clone());
@@ -398,22 +414,26 @@ impl LayerWeights {
 }
 
 /// Additive causal mask over absolute positions. Query row `i` sits at absolute position
-/// `index_pos + i`; key column `j` covers the whole cache `0..index_pos + tgt_len`. At
-/// `index_pos == 0` this is exactly the float path's `prepare_decoder_attention_mask`; unlike the
-/// float path (which relies on `RotatingKvCache` eviction), the sliding constraint is also applied
-/// to cached positions, since our concat cache never evicts.
+/// `index_pos + i`; the `kv_len` key columns are the last `kv_len` positions ending at the final
+/// query (column `c` is absolute position `index_pos + tgt_len - kv_len + c`) — the whole
+/// history on global layers, only the ring-retained tail on sliding layers. At `index_pos == 0`
+/// with full `kv_len` this is exactly the float path's `prepare_decoder_attention_mask`. The
+/// window rule admits `q - w..=q` (window + self); ring retention of the last `w` positions
+/// preserves exactly that set across steps.
 fn causal_mask(
     b_sz: usize,
     tgt_len: usize,
     index_pos: usize,
+    kv_len: usize,
     sliding_window: Option<usize>,
     device: &Device,
 ) -> Result<Tensor> {
-    let total = index_pos + tgt_len;
+    let key_start = index_pos + tgt_len - kv_len;
     let mask: Vec<f32> = (0..tgt_len)
         .flat_map(|i| {
             let q = index_pos + i;
-            (0..total).map(move |j| {
+            (0..kv_len).map(move |c| {
+                let j = key_start + c;
                 let masked = j > q || sliding_window.is_some_and(|w| j + w < q);
                 if masked {
                     f32::NEG_INFINITY
@@ -423,7 +443,7 @@ fn causal_mask(
             })
         })
         .collect();
-    Tensor::from_slice(&mask, (tgt_len, total), device)?.expand((b_sz, 1, tgt_len, total))
+    Tensor::from_slice(&mask, (tgt_len, kv_len), device)?.expand((b_sz, 1, tgt_len, kv_len))
 }
 
 /// Externalized per-layer KV cache for [`ModelWeights`].
@@ -802,6 +822,7 @@ impl ModelWeights {
                 head_dim,
                 rms_eps,
                 is_global,
+                window: (!is_global).then_some(sliding_window),
                 store_shared_kv,
                 rotary,
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
@@ -825,6 +846,8 @@ impl ModelWeights {
     }
 
     /// The full and sliding additive masks for this step (None where no position is masked).
+    /// Single-token steps never need a mask: no future position exists, and on sliding layers
+    /// the ring retention guarantees every cached position is inside the window.
     fn masks(
         &self,
         b_sz: usize,
@@ -833,15 +856,24 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let full = if seq_len > 1 {
-            Some(causal_mask(b_sz, seq_len, index_pos, None, device)?)
-        } else {
-            None
-        };
-        let sliding = if seq_len > 1 || index_pos + seq_len > self.sliding_window {
             Some(causal_mask(
                 b_sz,
                 seq_len,
                 index_pos,
+                index_pos + seq_len,
+                None,
+                device,
+            )?)
+        } else {
+            None
+        };
+        let sliding = if seq_len > 1 {
+            let kv_len = index_pos.min(self.sliding_window) + seq_len;
+            Some(causal_mask(
+                b_sz,
+                seq_len,
+                index_pos,
+                kv_len,
                 Some(self.sliding_window),
                 device,
             )?)
@@ -988,5 +1020,74 @@ impl ModelWeights {
 
     pub fn clear_kv_cache(&mut self) {
         self.cache.reset()
+    }
+
+    /// Whether layer `idx` uses sliding-window (iSWA) attention rather than full attention.
+    /// Sliding layers' cache lanes are ring-bounded at [`Self::sliding_window`] positions.
+    pub fn is_sliding(&self, idx: usize) -> bool {
+        self.layers.get(idx).is_some_and(|l| !l.is_global)
+    }
+
+    /// The iSWA attention window of the sliding layers, in positions.
+    pub fn sliding_window(&self) -> usize {
+        self.sliding_window
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::IndexOp;
+
+    fn grid(mask: &Tensor) -> Result<Vec<Vec<f32>>> {
+        mask.i((0, 0))?.to_vec2::<f32>()
+    }
+
+    const F: f32 = f32::NEG_INFINITY;
+
+    #[test]
+    fn full_mask_fresh_prefill_is_lower_triangular() -> Result<()> {
+        let m = causal_mask(1, 3, 0, 3, None, &Device::Cpu)?;
+        assert_eq!(
+            grid(&m)?,
+            vec![vec![0., F, F], vec![0., 0., F], vec![0., 0., 0.]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_mask_continued_chunk_sees_all_cached_positions() -> Result<()> {
+        // index_pos 2, two queries (q=2, q=3), full history (kv_len 4).
+        let m = causal_mask(1, 2, 2, 4, None, &Device::Cpu)?;
+        assert_eq!(grid(&m)?, vec![vec![0., 0., 0., F], vec![0., 0., 0., 0.]]);
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_mask_admits_window_plus_self() -> Result<()> {
+        // w=2, fresh prefill of 4: query q admits absolute q-2..=q.
+        let m = causal_mask(1, 4, 0, 4, Some(2), &Device::Cpu)?;
+        assert_eq!(
+            grid(&m)?,
+            vec![
+                vec![0., F, F, F],
+                vec![0., 0., F, F],
+                vec![0., 0., 0., F],
+                vec![F, 0., 0., 0.],
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_mask_ring_trimmed_kv_maps_columns_to_absolute_positions() -> Result<()> {
+        // w=3, index_pos 5, two queries (q=5, q=6); ring retained 3 cached positions, so the 5
+        // kv columns are absolute positions 2..=6.
+        let m = causal_mask(1, 2, 5, 5, Some(3), &Device::Cpu)?;
+        assert_eq!(
+            grid(&m)?,
+            vec![vec![0., 0., 0., 0., F], vec![F, 0., 0., 0., 0.]]
+        );
+        Ok(())
     }
 }
