@@ -361,7 +361,7 @@ impl LayerWeights {
         x: &Tensor,
         mask: Option<&Tensor>,
         cos_sin: &(Tensor, Tensor),
-        cache_slot: &mut Option<(Tensor, Tensor)>,
+        cache_slot: &mut Option<LayerCache>,
         shared_kv_states: &mut SharedKvStates,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
@@ -408,28 +408,18 @@ impl LayerWeights {
                 // V norm (RMS without learned weight), as one fused kernel.
                 let v = v_norm_fused(&v, &self.v_norm_ones, self.rms_eps)?;
 
-                let (k, v) = match cache_slot.as_ref() {
-                    Some((k_cache, v_cache)) => {
-                        let k = Tensor::cat(&[k_cache, &k], 2)?;
-                        let v = Tensor::cat(&[v_cache, &v], 2)?;
-                        (k, v)
-                    }
-                    None => (k, v),
-                };
-                // iSWA ring: retain only the last `window` positions on sliding layers — a query
-                // at position q attends the cached q-w..q-1 plus itself, exactly the set the
-                // additive mask admits, so every dropped position was already masked for all
-                // future queries. Global layers retain everything.
-                *cache_slot = Some(match self.window {
-                    Some(w) if k.dim(2)? > w => {
-                        let len = k.dim(2)?;
-                        (
-                            k.narrow(2, len - w, w)?.contiguous()?,
-                            v.narrow(2, len - w, w)?.contiguous()?,
-                        )
-                    }
-                    _ => (k.clone(), v.clone()),
-                });
+                // Mutable append (copy-on-write, chunk-amortized) then serve attention from
+                // narrow views — no per-token concat copy. Sliding layers' views present the
+                // last `window + seq_len` rows: exactly the set the iSWA mask admits, so masks
+                // and results match the old concat cache.
+                match cache_slot {
+                    Some(cell) => cell.append(&k, &v, self.window)?,
+                    None => *cache_slot = Some(LayerCache::from_tensors(k, v)?),
+                }
+                let (k, v) = cache_slot
+                    .as_ref()
+                    .expect("cache cell just ensured")
+                    .view_window(self.window, seq_len)?;
 
                 if self.store_shared_kv {
                     let kv = (k.clone(), v.clone());
@@ -533,20 +523,109 @@ fn causal_mask(
     Tensor::from_slice(&mask, (tgt_len, kv_len), device)?.expand((b_sz, 1, tgt_len, kv_len))
 }
 
+/// How many extra rows a KV buffer is padded with: sliding buffers compact once per this many
+/// appended tokens; global buffers grow by this granularity. Amortizes the copy that the old
+/// concat-append design paid on EVERY token to once per chunk.
+const KV_CHUNK: usize = 256;
+
+/// A preallocated K/V buffer `(b, n_kv_head, cap, head_dim)`. Appends write in place via
+/// `slice_set`; attention reads `narrow` views (verified copy-free and bit-identical on Metal).
+#[derive(Debug)]
+struct KvBuf {
+    k: Tensor,
+    v: Tensor,
+    cap: usize,
+}
+
+/// One layer's cache lane: a shared buffer + how many rows are valid. `Arc` ownership doubles as
+/// the copy-on-write signal — a fork (`Gemma4KvCache::clone`) bumps the count, so the next append
+/// on either lane rebuilds into a private buffer instead of writing through the shared one.
+#[derive(Debug, Clone)]
+struct LayerCache {
+    buf: std::sync::Arc<KvBuf>,
+    len: usize,
+}
+
+impl LayerCache {
+    /// The logical `(k, v)` views over the valid rows.
+    fn view(&self) -> Result<(Tensor, Tensor)> {
+        Ok((self.buf.k.narrow(2, 0, self.len)?, self.buf.v.narrow(2, 0, self.len)?))
+    }
+
+    /// Append `n` rows, copy-on-write: writes in place when this lane uniquely owns a buffer
+    /// with room; otherwise (forked, or full) rebuilds into a fresh private buffer first,
+    /// keeping only the last `window` rows on sliding layers (they're all a future query may
+    /// attend) — the once-per-chunk compaction that replaces the old every-token trim copy.
+    fn append(&mut self, k_new: &Tensor, v_new: &Tensor, window: Option<usize>) -> Result<()> {
+        let n = k_new.dim(2)?;
+        let unique = Arc::strong_count(&self.buf) == 1;
+        if !unique || self.len + n > self.buf.cap {
+            let keep = match window {
+                Some(w) => self.len.min(w),
+                None => self.len,
+            };
+            let cap = (keep + n + KV_CHUNK).next_multiple_of(KV_CHUNK);
+            let (b, h, _, d) = self.buf.k.dims4()?;
+            let k = Tensor::zeros((b, h, cap, d), self.buf.k.dtype(), self.buf.k.device())?;
+            let v = Tensor::zeros((b, h, cap, d), self.buf.v.dtype(), self.buf.v.device())?;
+            if keep > 0 {
+                let start = self.len - keep;
+                k.slice_set(&self.buf.k.narrow(2, start, keep)?.contiguous()?, 2, 0)?;
+                v.slice_set(&self.buf.v.narrow(2, start, keep)?.contiguous()?, 2, 0)?;
+            }
+            self.buf = Arc::new(KvBuf { k, v, cap });
+            self.len = keep;
+        }
+        self.buf.k.slice_set(&k_new.contiguous()?, 2, self.len)?;
+        self.buf.v.slice_set(&v_new.contiguous()?, 2, self.len)?;
+        self.len += n;
+        Ok(())
+    }
+
+    /// A fresh cell wrapping caller-built tensors (first fill of a lane, or cache surgery — see
+    /// [`Gemma4KvCache::set_layer`]).
+    fn from_tensors(k: Tensor, v: Tensor) -> Result<Self> {
+        let len = k.dim(2)?;
+        let cap = (len + KV_CHUNK).next_multiple_of(KV_CHUNK);
+        let (b, h, _, d) = k.dims4()?;
+        let kb = Tensor::zeros((b, h, cap, d), k.dtype(), k.device())?;
+        let vb = Tensor::zeros((b, h, cap, d), v.dtype(), v.device())?;
+        kb.slice_set(&k.contiguous()?, 2, 0)?;
+        vb.slice_set(&v.contiguous()?, 2, 0)?;
+        Ok(Self { buf: Arc::new(KvBuf { k: kb, v: vb, cap }), len })
+    }
+
+    /// The attention view for a step that just appended `n_new` rows: every valid row on global
+    /// layers (`window: None`); on sliding layers the last `window + n_new` rows — the exact set
+    /// the iSWA mask admits for the new queries, so masks and results match the old concat cache.
+    fn view_window(&self, window: Option<usize>, n_new: usize) -> Result<(Tensor, Tensor)> {
+        let visible = match window {
+            Some(w) => self.len.min(w + n_new),
+            None => self.len,
+        };
+        let start = self.len - visible;
+        Ok((
+            self.buf.k.narrow(2, start, visible)?,
+            self.buf.v.narrow(2, start, visible)?,
+        ))
+    }
+}
+
 /// Externalized per-layer KV cache for [`ModelWeights`].
 ///
-/// Holds one `(k, v)` pair per layer that computes its own K/V (shared-KV layers reuse their
+/// Holds one buffer cell per layer that computes its own K/V (shared-KV layers reuse their
 /// donor's entries and stay `None`), plus the stream position the cache has consumed up to.
 /// Callers that only use [`ModelWeights::forward`] never touch this type — the model owns an
 /// internal lane. Owning caches externally via [`ModelWeights::forward_with_cache`] lets one set
 /// of weights serve multiple independent sequences.
 ///
-/// Cloning is O(1): tensors are `Arc`-backed and the cache is append-only (no in-place tensor
-/// mutation), so a clone shares storage with its source and the two diverge naturally on their
-/// next appends.
+/// Cloning is O(1) and fork-safe: buffers are `Arc`-shared and appends are copy-on-write — the
+/// first append after a clone rebuilds that lane's buffer privately, so lanes never see each
+/// other's writes (and the every-token concat copy of the old design is gone; appends are
+/// in-place `slice_set` with a once-per-[`KV_CHUNK`] amortized compaction/growth copy).
 #[derive(Debug, Clone, Default)]
 pub struct Gemma4KvCache {
-    layers: Vec<Option<(Tensor, Tensor)>>,
+    layers: Vec<Option<LayerCache>>,
     pos: usize,
 }
 
@@ -556,8 +635,8 @@ impl Gemma4KvCache {
         self.pos
     }
 
-    /// Override the position bookkeeping. Only needed by callers that edit [`Self::layers_mut`]
-    /// directly and must keep the position consistent with their surgery.
+    /// Override the position bookkeeping. Only needed by callers that rebuild layers via
+    /// [`Self::set_layer`] and must keep the position consistent with their surgery.
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos
     }
@@ -570,16 +649,26 @@ impl Gemma4KvCache {
         }
     }
 
-    /// Per-layer cache entries, indexed by layer. `None` on shared-KV layers (and everywhere
-    /// before the first forward). K and V are shaped `(b, n_kv_head, seq, head_dim)`.
-    pub fn layers(&self) -> &[Option<(Tensor, Tensor)>] {
-        &self.layers
+    /// The logical `(k, v)` views for layer `idx` — `None` on shared-KV layers (and everywhere
+    /// before the first forward). Shaped `(b, n_kv_head, len, head_dim)`; cheap narrows into the
+    /// backing buffer, valid until the next decode/append on this lane.
+    pub fn layer_view(&self, idx: usize) -> Option<(Tensor, Tensor)> {
+        self.layers.get(idx)?.as_ref().and_then(|c| c.view().ok())
     }
 
-    /// Mutable per-layer access for cache surgery (external eviction policies etc.). Callers are
-    /// responsible for keeping [`Self::set_pos`] consistent with what they leave behind.
-    pub fn layers_mut(&mut self) -> &mut [Option<(Tensor, Tensor)>] {
-        &mut self.layers
+    /// Replace layer `idx`'s content with caller-built tensors (cache surgery — eviction
+    /// policies etc.). Keep [`Self::set_pos`] consistent with what you leave behind.
+    pub fn set_layer(&mut self, idx: usize, k: Tensor, v: Tensor) -> Result<()> {
+        if idx >= self.layers.len() {
+            candle::bail!("set_layer: layer {idx} out of range ({})", self.layers.len())
+        }
+        self.layers[idx] = Some(LayerCache::from_tensors(k, v)?);
+        Ok(())
+    }
+
+    /// Number of layer slots (0 before the first forward initializes the cache).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 }
 
