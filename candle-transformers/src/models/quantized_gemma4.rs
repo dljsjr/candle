@@ -15,6 +15,11 @@
 //! are looked up via [`QTensor::embedding`] — dequantizing the PLE table (~2.3B params at Q6_K)
 //! would cost ~9 GB in f32 and defeat the point of the quantized model.
 //!
+//! KV-cache state lives outside the weights ([`Gemma4KvCache`]): [`ModelWeights::forward`] runs
+//! a single internal lane, while [`ModelWeights::forward_with_cache`] lets a caller own any
+//! number of independent lanes over one set of weights (multi-session inference; forking a lane
+//! is an O(1) clone).
+//!
 //! Based on the HuggingFace `transformers` gemma4 implementation (Apache-2.0) and eddyb's #3608.
 //! See `.sandpiper/docs/gemma4-candle-gguf-plan.md` for the full tensor/metadata map.
 
@@ -290,7 +295,6 @@ struct LayerWeights {
     store_shared_kv: bool,
 
     rotary: RotaryEmbedding,
-    kv_cache: Option<(Tensor, Tensor)>,
 
     span_attn: tracing::Span,
     span_mlp: tracing::Span,
@@ -298,10 +302,11 @@ struct LayerWeights {
 
 impl LayerWeights {
     fn forward_attn(
-        &mut self,
+        &self,
         x: &Tensor,
         mask: Option<&Tensor>,
         index_pos: usize,
+        cache_slot: &mut Option<(Tensor, Tensor)>,
         shared_kv_states: &mut SharedKvStates,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
@@ -335,15 +340,15 @@ impl LayerWeights {
                 // V norm (RMS without learned weight)
                 let v = v_norm(&v, self.rms_eps)?;
 
-                let (k, v) = match &self.kv_cache {
-                    Some((k_cache, v_cache)) if index_pos > 0 => {
+                let (k, v) = match cache_slot.as_ref() {
+                    Some((k_cache, v_cache)) => {
                         let k = Tensor::cat(&[k_cache, &k], 2)?;
                         let v = Tensor::cat(&[v_cache, &v], 2)?;
                         (k, v)
                     }
-                    _ => (k, v),
+                    None => (k, v),
                 };
-                self.kv_cache = Some((k.clone(), v.clone()));
+                *cache_slot = Some((k.clone(), v.clone()));
 
                 if self.store_shared_kv {
                     let kv = (k.clone(), v.clone());
@@ -421,6 +426,56 @@ fn causal_mask(
     Tensor::from_slice(&mask, (tgt_len, total), device)?.expand((b_sz, 1, tgt_len, total))
 }
 
+/// Externalized per-layer KV cache for [`ModelWeights`].
+///
+/// Holds one `(k, v)` pair per layer that computes its own K/V (shared-KV layers reuse their
+/// donor's entries and stay `None`), plus the stream position the cache has consumed up to.
+/// Callers that only use [`ModelWeights::forward`] never touch this type — the model owns an
+/// internal lane. Owning caches externally via [`ModelWeights::forward_with_cache`] lets one set
+/// of weights serve multiple independent sequences.
+///
+/// Cloning is O(1): tensors are `Arc`-backed and the cache is append-only (no in-place tensor
+/// mutation), so a clone shares storage with its source and the two diverge naturally on their
+/// next appends.
+#[derive(Debug, Clone, Default)]
+pub struct Gemma4KvCache {
+    layers: Vec<Option<(Tensor, Tensor)>>,
+    pos: usize,
+}
+
+impl Gemma4KvCache {
+    /// The next stream position this cache expects (= number of positions consumed so far).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Override the position bookkeeping. Only needed by callers that edit [`Self::layers_mut`]
+    /// directly and must keep the position consistent with their surgery.
+    pub fn set_pos(&mut self, pos: usize) {
+        self.pos = pos
+    }
+
+    /// Drop all cached K/V and rewind to position 0.
+    pub fn reset(&mut self) {
+        self.pos = 0;
+        for slot in self.layers.iter_mut() {
+            *slot = None
+        }
+    }
+
+    /// Per-layer cache entries, indexed by layer. `None` on shared-KV layers (and everywhere
+    /// before the first forward). K and V are shaped `(b, n_kv_head, seq, head_dim)`.
+    pub fn layers(&self) -> &[Option<(Tensor, Tensor)>] {
+        &self.layers
+    }
+
+    /// Mutable per-layer access for cache surgery (external eviction policies etc.). Callers are
+    /// responsible for keeping [`Self::set_pos`] consistent with what they leave behind.
+    pub fn layers_mut(&mut self) -> &mut [Option<(Tensor, Tensor)>] {
+        &mut self.layers
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
     tok_embeddings: Arc<QTensor>, // GGUF `token_embd` (also the tied output)
@@ -433,6 +488,10 @@ pub struct ModelWeights {
     norm: RmsNorm,
     output: QMatMul, // tied to `token_embd`
     final_logit_softcapping: Option<f64>,
+
+    /// The internal lane used by [`Self::forward`]; external lanes go through
+    /// [`Self::forward_with_cache`].
+    cache: Gemma4KvCache,
 
     span: tracing::Span,
     span_output: tracing::Span,
@@ -745,7 +804,6 @@ impl ModelWeights {
                 is_global,
                 store_shared_kv,
                 rotary,
-                kv_cache: None,
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                 span_mlp: tracing::span!(tracing::Level::TRACE, "attn-mlp"),
             });
@@ -760,6 +818,7 @@ impl ModelWeights {
             norm,
             output,
             final_logit_softcapping,
+            cache: Gemma4KvCache::default(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         })
@@ -792,9 +851,44 @@ impl ModelWeights {
         Ok((full, sliding))
     }
 
+    /// Forward on the model's internal cache lane (single-sequence use). For multiple sequences
+    /// over one set of weights, use [`Self::forward_with_cache`] with caller-owned lanes.
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let mut cache = std::mem::take(&mut self.cache);
+        let res = self.forward_with_cache(x, index_pos, &mut cache);
+        self.cache = cache;
+        res
+    }
+
+    /// Forward against a caller-owned cache lane. `index_pos == 0` resets the lane (a fresh
+    /// prefill); any other `index_pos` must equal [`Gemma4KvCache::pos`] — decoding at a drifted
+    /// position is a caller bug and fails loudly rather than silently mis-attending.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &mut Gemma4KvCache,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len) = x.dims2()?;
+
+        if cache.layers.is_empty() {
+            cache.layers = vec![None; self.layers.len()];
+        } else if cache.layers.len() != self.layers.len() {
+            candle::bail!(
+                "cache has {} layers but the model has {}",
+                cache.layers.len(),
+                self.layers.len()
+            )
+        }
+        if index_pos == 0 {
+            cache.reset();
+        } else if index_pos != cache.pos {
+            candle::bail!(
+                "cache position drift: forward at index_pos {index_pos} but the cache is at {}",
+                cache.pos
+            )
+        }
 
         let xs = self.tok_embeddings.embedding(x)?;
         let xs = (xs * (self.embedding_length as f64).sqrt())?;
@@ -823,7 +917,12 @@ impl ModelWeights {
 
         let mut shared_kv_states = SharedKvStates::default();
         let mut xs = xs;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        for (i, (layer, cache_slot)) in self
+            .layers
+            .iter()
+            .zip(cache.layers.iter_mut())
+            .enumerate()
+        {
             let mask = if layer.is_global {
                 full_mask.as_ref()
             } else {
@@ -832,7 +931,7 @@ impl ModelWeights {
 
             let residual = &xs;
             let x1 = layer.input_layernorm.forward(&xs)?;
-            let x1 = layer.forward_attn(&x1, mask, index_pos, &mut shared_kv_states)?;
+            let x1 = layer.forward_attn(&x1, mask, index_pos, cache_slot, &mut shared_kv_states)?;
             let x1 = layer.post_attention_layernorm.forward(&x1)?;
             let xs_attn = (x1 + residual)?;
 
@@ -876,6 +975,7 @@ impl ModelWeights {
 
             xs = xs_mixed.broadcast_mul(&layer.layer_scalar)?;
         }
+        cache.pos = index_pos + seq_len;
 
         let _enter = self.span_output.enter();
         let logits = xs.narrow(1, seq_len - 1, 1)?.apply(&self.norm)?;
@@ -887,8 +987,6 @@ impl ModelWeights {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.kv_cache = None
-        }
+        self.cache.reset()
     }
 }
