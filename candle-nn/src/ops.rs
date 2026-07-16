@@ -1325,3 +1325,131 @@ pub fn sdpa(
         },
     )
 }
+
+#[derive(Debug, Clone)]
+struct MulMvF16;
+
+impl candle::CustomOp2 for MulMvF16 {
+    fn name(&self) -> &'static str {
+        "mul-mv-f16"
+    }
+
+    /// Reference implementation: batched strided dot products (correct anywhere, slow — real
+    /// call sites gate on Metal and fall back to plain matmul elsewhere).
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        let (b, h, s, d) = l1.shape().dims4()?;
+        let (b2, h2, m, d2) = l2.shape().dims4()?;
+        if b != b2 || h != h2 || d != d2 {
+            candle::bail!(
+                "mul-mv-f16 shape mismatch: {:?} vs {:?}",
+                l1.shape(),
+                l2.shape()
+            )
+        }
+        let k = match s1 {
+            CpuStorage::F16(v) => v,
+            _ => candle::bail!("mul-mv-f16 expects an f16 matrix, got {:?}", s1.dtype()),
+        };
+        let q = match s2 {
+            CpuStorage::F32(v) => v,
+            _ => candle::bail!("mul-mv-f16 expects f32 vectors, got {:?}", s2.dtype()),
+        };
+        let ks = l1.stride();
+        let qs = l2.stride();
+        let (k0, q0) = (l1.start_offset(), l2.start_offset());
+        let mut out = vec![0f32; b * h * m * s];
+        for bi in 0..b {
+            for hi in 0..h {
+                for mi in 0..m {
+                    for si in 0..s {
+                        let krow = k0 + bi * ks[0] + hi * ks[1] + si * ks[2];
+                        let qrow = q0 + bi * qs[0] + hi * qs[1] + mi * qs[2];
+                        let mut acc = 0f32;
+                        for di in 0..d {
+                            acc += f32::from(k[krow + di * ks[3]]) * q[qrow + di * qs[3]];
+                        }
+                        out[((bi * h + hi) * m + mi) * s + si] = acc;
+                    }
+                }
+            }
+        }
+        Ok((CpuStorage::F32(out), Shape::from_dims(&[b, h, m, s])))
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &candle::MetalStorage,
+        l1: &Layout,
+        s2: &candle::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        let (b, h, s, d) = l1.shape().dims4()?;
+        let (b2, h2, m, d2) = l2.shape().dims4()?;
+        if b != 1 || b2 != 1 || h != h2 || d != d2 {
+            candle::bail!(
+                "mul-mv-f16: unsupported shapes {:?} × {:?} (batch dim must be 1)",
+                l1.shape(),
+                l2.shape()
+            )
+        }
+        if s1.dtype() != DType::F16 || s2.dtype() != DType::F32 {
+            candle::bail!(
+                "mul-mv-f16 expects f16 × f32, got {:?} × {:?}",
+                s1.dtype(),
+                s2.dtype()
+            )
+        }
+        let ks = l1.stride();
+        if ks[3] != 1 {
+            candle::bail!("mul-mv-f16: matrix rows must be contiguous in the last dim")
+        }
+        if !l2.is_contiguous() {
+            candle::bail!("mul-mv-f16: vectors must be contiguous")
+        }
+        let device = s1.device();
+        let elem_count = h * m * s;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, DType::F32)
+            .with_label("mul-mv-f16")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        encoder.set_label("mul-mv-f16");
+        candle_metal_kernels::call_mul_mv_f16_f32(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            (h, s, d, m),
+            s1.buffer(),
+            l1.start_offset() * 2,
+            ks[2],
+            ks[1],
+            s2.buffer(),
+            l2.start_offset() * 4,
+            d,
+            m * d,
+            &output,
+        )
+        .map_err(candle::Error::wrap)?;
+        let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, DType::F32);
+        Ok((newstorage, Shape::from_dims(&[1, h, m, s])))
+    }
+}
+
+/// Skinny-shape decode-attention scores: `k (1, h, s, d) f16` (narrowed cache views welcome —
+/// real strides pass through) × `q (1, h, m, d) f32` → `(1, h, m, s) f32`, computed as
+/// s-parallel dot products (ggml's `mul_mv` kernel: one simdgroup per K row → full occupancy at
+/// any `s`). Purpose-built for decode attention, where `m` is a handful of query rows and a
+/// tiled gemm cannot fill the GPU; the f32 output feeds softmax directly.
+pub fn mul_mv_f16(k: &Tensor, q: &Tensor) -> Result<Tensor> {
+    k.apply_op2_no_bwd(q, &MulMvF16)
+}

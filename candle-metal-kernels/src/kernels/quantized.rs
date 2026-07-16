@@ -24,6 +24,93 @@ pub enum GgmlDType {
     BF16,
 }
 
+/// ggml's `kernel_mul_mv_f16_f32`: src0 = a batch of f16 matrices, src1 = f32 vectors, dst =
+/// f32 `(batch, vecs, rows)`. One simdgroup per matrix row → full occupancy on skinny products
+/// (decode attention: `s` rows × a handful of query vectors) where a tiled gemm cannot fill the
+/// GPU. Strides are in ELEMENTS (converted to bytes here); offsets are in BYTES. src0 rows must
+/// be contiguous in their last dim (views with strided row/batch steps are fine — that is the
+/// point of passing real strides, unlike `call_quantized_matmul_mv_t`, whose F16/F32 arms pass
+/// nb=0 and are not usable for the non-quantized template kernels).
+#[allow(clippy::too_many_arguments)]
+pub fn call_mul_mv_f16_f32(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (batch, rows, cols, vecs): (usize, usize, usize, usize),
+    src0: &Buffer,
+    src0_offset: usize,
+    src0_row_stride: usize,
+    src0_batch_stride: usize,
+    src1: &Buffer,
+    src1_offset: usize,
+    src1_vec_stride: usize,
+    src1_batch_stride: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let ne00 = cols as i64;
+    let ne01 = rows as i64;
+    let ne02 = batch as i64;
+    let nb00 = 2i64; // f16
+    let nb01 = (src0_row_stride * 2) as i64;
+    let nb02 = (src0_batch_stride * 2) as i64;
+    let ne10 = cols as i64;
+    let ne11 = vecs as i64;
+    let ne12 = batch as i64;
+    let nb10 = 4i64; // f32
+    let nb11 = (src1_vec_stride * 4) as i64;
+    let nb12 = (src1_batch_stride * 4) as i64;
+    let ne0 = rows as i64;
+    let ne1 = vecs as i64;
+    let r2: u32 = 1;
+    let r3: u32 = 1;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, "kernel_mul_mv_f16_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "mul_mv_f16_f32 B={batch} S={rows} D={cols} V={vecs}");
+
+    set_params!(
+        encoder,
+        (
+            (src0, src0_offset),
+            (src1, src1_offset),
+            Output::with_offset(dst, 0),
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            r2,
+            r3
+        )
+    );
+
+    // Kernel geometry: tgpig.x = one matrix row per threadgroup, tgpig.y covers the vectors in
+    // chunks of N_MV_T_T (= 4 in the shader), tgpig.z = batch; 32 threads = one simdgroup.
+    let thread_groups_count = MTLSize {
+        width: rows,
+        height: vecs.div_ceil(4),
+        depth: batch,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_t(
     device: &Device,
