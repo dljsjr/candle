@@ -494,11 +494,11 @@ impl LayerWeights {
             candle_nn::ops::mul_mv_f16(&v, &probs)?
         } else {
             // Fallback gemm ON the stored transposed layout: (b,h,d,s)·(b,h,s,m) → transpose.
-            // Never re-materialize V (a per-token O(s·d) copy); gemm handles strided operands.
-            // The contiguous() is on the (m,d) OUTPUT — kilobytes — for the reshape below.
-            v.matmul(&probs.to_dtype(v.dtype())?.transpose(2, 3)?)?
-                .transpose(2, 3)?
-                .contiguous()?
+            // Never re-materialize V (a per-token O(s·d) copy); the contiguous() copies are the
+            // attention-weight-sized probs transpose and the (m,d) output — both O(m·s)/O(m·d),
+            // not O(s·d) — and V's own strided view is a standard lda pattern gemm accepts.
+            let probs_t = probs.to_dtype(v.dtype())?.transpose(2, 3)?.contiguous()?;
+            v.matmul(&probs_t)?.transpose(2, 3)?.contiguous()?
         };
 
         let attn_output = attn_output
