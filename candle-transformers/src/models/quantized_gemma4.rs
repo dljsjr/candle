@@ -361,6 +361,7 @@ impl LayerWeights {
         x: &Tensor,
         mask: Option<&Tensor>,
         cos_sin: &(Tensor, Tensor),
+        kv_dtype: DType,
         cache_slot: &mut Option<LayerCache>,
         shared_kv_states: &mut SharedKvStates,
     ) -> Result<Tensor> {
@@ -407,6 +408,10 @@ impl LayerWeights {
                 let k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
                 // V norm (RMS without learned weight), as one fused kernel.
                 let v = v_norm_fused(&v, &self.v_norm_ones, self.rms_eps)?;
+                // Cache dtype (f16 halves KV bandwidth — the context-slope cost): rope/norms ran
+                // in f32 above; K/V drop to the cache dtype here, before they're stored or read.
+                let k = k.to_dtype(kv_dtype)?;
+                let v = v.to_dtype(kv_dtype)?;
 
                 // Mutable append (copy-on-write, chunk-amortized) then serve attention from
                 // narrow views — no per-token concat copy. Sliding layers' views present the
@@ -470,19 +475,23 @@ impl LayerWeights {
         };
 
         // No 1/sqrt(head_dim) scaling: gemma-4 q/k-norms make it superfluous and the reference
-        // uses scale 1.0 (parity-validated in the float path).
-        let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
+        // uses scale 1.0 (parity-validated in the float path). Q matches the cache dtype (an
+        // f16 cache runs the QK/AV matmuls in f16, halving the K/V read bandwidth — llama.cpp's
+        // regime); the scores are cast up so the mask add and softmax stay in f32 either way.
+        let q = q.to_dtype(k.dtype())?;
+        let attn_weights = q.matmul(&k.transpose(2, 3)?)?.to_dtype(DType::F32)?;
         let attn_weights = match &mask_t {
             None => attn_weights,
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
-        // The reference runs the attention softmax in f32 (a no-op here where everything is f32
-        // already, but kept explicit to match the float path).
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
-            .to_dtype(v.dtype())?;
+        // The reference runs the attention softmax in f32 (the verified-bf16-degradation
+        // finding), then the probabilities drop back to the cache dtype for the AV matmul.
+        let attn_weights =
+            candle_nn::ops::softmax_last_dim(&attn_weights)?.to_dtype(v.dtype())?;
         let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output
+            .to_dtype(x.dtype())?
             .reshape((b_sz, self.n_head, seq_len, self.head_dim))?
             .transpose(1, 2)?
             .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
@@ -688,6 +697,10 @@ pub struct ModelWeights {
     norm: RmsNorm,
     output: QMatMul, // tied to `token_embd`
     final_logit_softcapping: Option<f64>,
+    /// KV-cache storage dtype (default F32). F16 halves the attention-read bandwidth that
+    /// dominates long-context decode; the QK/AV matmuls then run in f16 while the softmax stays
+    /// f32 (kernel-rounding-scale deltas — the same regime as llama.cpp's f16 KV default).
+    kv_dtype: DType,
 
     /// The internal lane used by [`Self::forward`]; external lanes go through
     /// [`Self::forward_with_cache`].
@@ -1028,6 +1041,7 @@ impl ModelWeights {
             norm,
             output,
             final_logit_softcapping,
+            kv_dtype: DType::F32,
             cache: Gemma4KvCache::default(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
@@ -1155,7 +1169,14 @@ impl ModelWeights {
 
             let residual = &xs;
             let x1 = layer.input_layernorm.forward(&xs)?;
-            let x1 = layer.forward_attn(&x1, mask, cos_sin, cache_slot, &mut shared_kv_states)?;
+            let x1 = layer.forward_attn(
+                &x1,
+                mask,
+                cos_sin,
+                self.kv_dtype,
+                cache_slot,
+                &mut shared_kv_states,
+            )?;
             let x1 = layer.post_attention_layernorm.forward(&x1)?;
             let xs_attn = (x1 + residual)?;
 
@@ -1212,6 +1233,19 @@ impl ModelWeights {
 
     pub fn clear_kv_cache(&mut self) {
         self.cache.reset()
+    }
+
+    /// Set the KV-cache storage dtype (F32 default; F16/BF16 halve the long-context attention
+    /// bandwidth at kernel-rounding-scale numeric deltas). Call before the first forward — or
+    /// reset every cache lane after changing it, since appends must match the buffer dtype.
+    pub fn set_kv_cache_dtype(&mut self, dtype: DType) -> Result<()> {
+        match dtype {
+            DType::F32 | DType::F16 | DType::BF16 => {
+                self.kv_dtype = dtype;
+                Ok(())
+            }
+            _ => candle::bail!("kv cache dtype must be F32, F16, or BF16, got {dtype:?}"),
+        }
     }
 
     /// Whether layer `idx` uses sliding-window (iSWA) attention rather than full attention.
