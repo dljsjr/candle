@@ -421,6 +421,7 @@ impl LayerWeights {
                     Some(cell) => cell.append(&k, &v, self.window)?,
                     None => *cache_slot = Some(LayerCache::from_tensors(k, v)?),
                 }
+                // (k, v_t): V comes back in its stored transposed orientation for the AV mat-vec.
                 let (k, v) = cache_slot
                     .as_ref()
                     .expect("cache cell just ensured")
@@ -475,20 +476,26 @@ impl LayerWeights {
         };
 
         // No 1/sqrt(head_dim) scaling: gemma-4 q/k-norms make it superfluous and the reference
-        // uses scale 1.0 (parity-validated in the float path). Q matches the cache dtype (an
-        // f16 cache runs the QK/AV matmuls in f16, halving the K/V read bandwidth — llama.cpp's
-        // regime); the scores are cast up so the mask add and softmax stay in f32 either way.
+        // uses scale 1.0 (parity-validated in the float path). Q matches the cache dtype; the
+        // scores are cast up so the mask add and softmax stay in f32 either way (the verified-
+        // bf16-degradation finding). `v` here is the STORED transposed view `(b, h, d, s)`.
         let q = q.to_dtype(k.dtype())?;
         let attn_weights = q.matmul(&k.transpose(2, 3)?)?.to_dtype(DType::F32)?;
         let attn_weights = match &mask_t {
             None => attn_weights,
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
-        // The reference runs the attention softmax in f32 (the verified-bf16-degradation
-        // finding), then the probabilities drop back to the cache dtype for the AV matmul.
-        let attn_weights =
-            candle_nn::ops::softmax_last_dim(&attn_weights)?.to_dtype(v.dtype())?;
-        let attn_output = attn_weights.matmul(&v)?;
+        let probs = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        // AV: on Metal with an f16 cache, the s-parallel mat-vec over transposed V (the tiled
+        // gemm at the decode shape is the attention chain's dominant cost — 2.5× slower; see
+        // the mutable-KV design doc, addendum 2). It consumes the f32 probs directly. Tiled-gemm
+        // fallback elsewhere, with the probs dropped to the cache dtype as before.
+        let attn_output = if v.dtype() == DType::F16 && matches!(v.device(), Device::Metal(_)) {
+            candle_nn::ops::mul_mv_f16(&v, &probs)?
+        } else {
+            let v = v.transpose(2, 3)?.contiguous()?;
+            probs.to_dtype(v.dtype())?.matmul(&v)?
+        };
 
         let attn_output = attn_output
             .to_dtype(x.dtype())?
@@ -537,8 +544,11 @@ fn causal_mask(
 /// concat-append design paid on EVERY token to once per chunk.
 const KV_CHUNK: usize = 256;
 
-/// A preallocated K/V buffer `(b, n_kv_head, cap, head_dim)`. Appends write in place via
-/// `slice_set`; attention reads `narrow` views (verified copy-free and bit-identical on Metal).
+/// A preallocated K/V buffer. K is `(b, n_kv_head, cap, head_dim)`; V is stored TRANSPOSED —
+/// `(b, n_kv_head, head_dim, cap)`, llama.cpp's V-cache layout — so the AV product can run as
+/// an s-parallel mat-vec over contiguous s-length rows (the tiled gemm at the decode shape is
+/// 76% of the attention chain and 2.5× slower; see the design doc's addendum 2). Appends write
+/// in place via `slice_set`; attention reads `narrow` views (verified copy-free on Metal).
 #[derive(Debug)]
 struct KvBuf {
     k: Tensor,
@@ -556,9 +566,13 @@ struct LayerCache {
 }
 
 impl LayerCache {
-    /// The logical `(k, v)` views over the valid rows.
+    /// The logical `(k, v)` views over the valid rows, both in the PUBLIC `(b, h, len, d)`
+    /// orientation (v is a transpose view into the transposed storage — strided, zero-copy).
     fn view(&self) -> Result<(Tensor, Tensor)> {
-        Ok((self.buf.k.narrow(2, 0, self.len)?, self.buf.v.narrow(2, 0, self.len)?))
+        Ok((
+            self.buf.k.narrow(2, 0, self.len)?,
+            self.buf.v.narrow(3, 0, self.len)?.transpose(2, 3)?,
+        ))
     }
 
     /// Append `n` rows, copy-on-write: writes in place when this lane uniquely owns a buffer
@@ -576,37 +590,43 @@ impl LayerCache {
             let cap = (keep + n + KV_CHUNK).next_multiple_of(KV_CHUNK);
             let (b, h, _, d) = self.buf.k.dims4()?;
             let k = Tensor::zeros((b, h, cap, d), self.buf.k.dtype(), self.buf.k.device())?;
-            let v = Tensor::zeros((b, h, cap, d), self.buf.v.dtype(), self.buf.v.device())?;
+            let v = Tensor::zeros((b, h, d, cap), self.buf.v.dtype(), self.buf.v.device())?;
             if keep > 0 {
                 let start = self.len - keep;
                 k.slice_set(&self.buf.k.narrow(2, start, keep)?.contiguous()?, 2, 0)?;
-                v.slice_set(&self.buf.v.narrow(2, start, keep)?.contiguous()?, 2, 0)?;
+                v.slice_set(&self.buf.v.narrow(3, start, keep)?.contiguous()?, 3, 0)?;
             }
             self.buf = Arc::new(KvBuf { k, v, cap });
             self.len = keep;
         }
         self.buf.k.slice_set(&k_new.contiguous()?, 2, self.len)?;
-        self.buf.v.slice_set(&v_new.contiguous()?, 2, self.len)?;
+        // V arrives (b, h, n, d); storage is transposed — a 2 KB copy at decode, chunk-sized at
+        // prefill.
+        self.buf
+            .v
+            .slice_set(&v_new.transpose(2, 3)?.contiguous()?, 3, self.len)?;
         self.len += n;
         Ok(())
     }
 
-    /// A fresh cell wrapping caller-built tensors (first fill of a lane, or cache surgery — see
-    /// [`Gemma4KvCache::set_layer`]).
+    /// A fresh cell wrapping caller-built tensors in the PUBLIC `(b, h, s, d)` orientation
+    /// (first fill of a lane, or cache surgery — see [`Gemma4KvCache::set_layer`]).
     fn from_tensors(k: Tensor, v: Tensor) -> Result<Self> {
         let len = k.dim(2)?;
         let cap = (len + KV_CHUNK).next_multiple_of(KV_CHUNK);
         let (b, h, _, d) = k.dims4()?;
         let kb = Tensor::zeros((b, h, cap, d), k.dtype(), k.device())?;
-        let vb = Tensor::zeros((b, h, cap, d), v.dtype(), v.device())?;
+        let vb = Tensor::zeros((b, h, d, cap), v.dtype(), v.device())?;
         kb.slice_set(&k.contiguous()?, 2, 0)?;
-        vb.slice_set(&v.contiguous()?, 2, 0)?;
+        vb.slice_set(&v.transpose(2, 3)?.contiguous()?, 3, 0)?;
         Ok(Self { buf: Arc::new(KvBuf { k: kb, v: vb, cap }), len })
     }
 
-    /// The attention view for a step that just appended `n_new` rows: every valid row on global
+    /// The attention views for a step that just appended `n_new` rows: every valid row on global
     /// layers (`window: None`); on sliding layers the last `window + n_new` rows — the exact set
     /// the iSWA mask admits for the new queries, so masks and results match the old concat cache.
+    /// Returns `(k, v_t)`: K in `(b, h, visible, d)`, V in its STORED transposed orientation
+    /// `(b, h, d, visible)` — the AV mat-vec consumes it directly; the gemm fallback transposes.
     fn view_window(&self, window: Option<usize>, n_new: usize) -> Result<(Tensor, Tensor)> {
         let visible = match window {
             Some(w) => self.len.min(w + n_new),
@@ -615,7 +635,7 @@ impl LayerCache {
         let start = self.len - visible;
         Ok((
             self.buf.k.narrow(2, start, visible)?,
-            self.buf.v.narrow(2, start, visible)?,
+            self.buf.v.narrow(3, start, visible)?,
         ))
     }
 }
