@@ -493,8 +493,12 @@ impl LayerWeights {
         let attn_output = if v.dtype() == DType::F16 && matches!(v.device(), Device::Metal(_)) {
             candle_nn::ops::mul_mv_f16(&v, &probs)?
         } else {
-            let v = v.transpose(2, 3)?.contiguous()?;
-            probs.to_dtype(v.dtype())?.matmul(&v)?
+            // Fallback gemm ON the stored transposed layout: (b,h,d,s)·(b,h,s,m) → transpose.
+            // Never re-materialize V (a per-token O(s·d) copy); gemm handles strided operands.
+            // The contiguous() is on the (m,d) OUTPUT — kilobytes — for the reshape below.
+            v.matmul(&probs.to_dtype(v.dtype())?.transpose(2, 3)?)?
+                .transpose(2, 3)?
+                .contiguous()?
         };
 
         let attn_output = attn_output
