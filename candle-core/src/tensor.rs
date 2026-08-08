@@ -1951,6 +1951,42 @@ impl Tensor {
         }
     }
 
+    /// Metal only: the async counterpart to `to_vec1` for a 1D tensor. Encodes the device→host
+    /// blit now (committed, but NOT waited on), returning a handle whose value can be read later —
+    /// e.g. after encoding further GPU work, so the eventual wait overlaps that work instead of
+    /// blocking here. Requires a rank-1, contiguous, Metal-resident tensor of dtype `S::DTYPE`
+    /// (unlike `to_vec1`, this skips the strided-gather fallback — a caller with a non-contiguous
+    /// tensor should `.contiguous()` it first, same as any other Metal fast path).
+    #[cfg(feature = "metal")]
+    #[must_use = "a MetalPendingReadback holds a committed but unwaited blit; dropping it un-called \
+                  waits automatically (safe) but discards the value — call `wait_and_read`"]
+    pub fn metal_readback_async<S: crate::WithDType>(
+        &self,
+    ) -> Result<crate::MetalPendingReadback<S>> {
+        if self.rank() != 1 {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: 1,
+                got: self.rank(),
+                shape: self.shape().clone(),
+            }
+            .bt())?
+        }
+        if self.layout.contiguous_offsets().is_none() {
+            crate::bail!("metal_readback_async requires a contiguous tensor")
+        }
+        if self.dtype() != S::DTYPE {
+            crate::bail!(
+                "metal_readback_async dtype mismatch: tensor is {:?}, requested {:?}",
+                self.dtype(),
+                S::DTYPE
+            )
+        }
+        match &*self.storage() {
+            Storage::Metal(storage) => storage.to_cpu_async(),
+            _ => crate::bail!("metal_readback_async requires a Metal tensor"),
+        }
+    }
+
     /// Returns the data contained in a 2D tensor as a vector of vector of scalar values.
     pub fn to_vec2<S: crate::WithDType>(&self) -> Result<Vec<Vec<S>>> {
         let (dim1, dim2) = self.dims2()?;

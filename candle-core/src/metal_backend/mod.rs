@@ -6,7 +6,7 @@ use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
-    metal::{Buffer, Commands, Device, ResidencySet},
+    metal::{Buffer, CommandBuffer, Commands, Device, ResidencySet},
     BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
@@ -2017,6 +2017,91 @@ impl MetalStorage {
         self.device.flush_and_wait_current()?;
         Ok(read_to_vec(&buffer, self.count))
     }
+
+    /// The async counterpart to `to_cpu`: encodes the same blit, but commits WITHOUT waiting and
+    /// hands back a [`MetalPendingReadback`] instead of blocking here. The caller can encode more
+    /// GPU work immediately (it lands in a fresh command buffer) and read the value later —
+    /// `MetalPendingReadback::wait_and_read`'s wait is a no-op if the GPU has already finished the
+    /// blit by then, which is the whole point: a wait deferred behind enough other encoded work
+    /// costs nothing. Does not call `drop_unused_buffers` (see `MetalDevice::flush_returning_handle`).
+    pub(crate) fn to_cpu_async<T: Clone>(&self) -> Result<MetalPendingReadback<T>> {
+        let size = self.count * self.dtype.size_in_bytes();
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size(size)
+            .with_label("blit_to_cpu_dst_async")
+            .build()?;
+        {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("blit_to_cpu_async");
+            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
+        }
+        let handle = self.device.flush_returning_handle()?;
+        Ok(MetalPendingReadback {
+            buffer,
+            handle,
+            count: self.count,
+            dtype: self.dtype,
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+/// A Metal device→host readback that has been committed (its command buffer submitted to the
+/// GPU) but not yet waited on — the async counterpart to an immediate `to_cpu`/`to_vec1`. Obtain
+/// one via [`crate::Tensor::metal_readback_async`]; call [`Self::wait_and_read`] once the value is
+/// actually needed. Holds its own `Arc<Buffer>`, independent of the source tensor's storage, so it
+/// stays valid even if the source tensor is dropped or its lane is later mutated in place.
+///
+/// `#[must_use]`, and `Drop` waits on the handle if a caller never calls `wait_and_read`: the
+/// destination buffer comes from the shared pool (`MetalDevice::allocate_buffer`), which reclaims
+/// any buffer at `Arc::strong_count == 1` — dropping this un-waited would return the buffer to the
+/// pool while the committed blit may still be executing, letting a *different*, unrelated op reuse
+/// it mid-write. `CommandBuffer::wait_until_completed` on an already-completed buffer returns
+/// immediately, so the safety net costs nothing on the normal (`wait_and_read`-called) path beyond
+/// one redundant already-satisfied wait, and only a real wait on the rare discard path.
+#[must_use]
+pub struct MetalPendingReadback<T> {
+    buffer: Arc<Buffer>,
+    handle: CommandBuffer,
+    count: usize,
+    dtype: DType,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> Drop for MetalPendingReadback<T> {
+    fn drop(&mut self) {
+        self.handle.wait_until_completed();
+    }
+}
+
+impl<T: crate::WithDType> MetalPendingReadback<T> {
+    /// Block until the GPU has written the buffer — a no-op if it already has, since
+    /// `CommandBuffer::wait_until_completed` on an already-completed buffer returns immediately —
+    /// then copy the bytes out.
+    pub fn wait_and_read(self) -> Vec<T> {
+        self.handle.wait_until_completed();
+        read_to_vec(&self.buffer, self.count)
+    }
+
+    /// Like `wait_and_read`, but writes into a caller-owned buffer instead of allocating a fresh
+    /// `Vec` — for a caller that reads a readback of the same size every call and wants to reuse
+    /// one buffer's capacity across calls (a fresh per-call `Vec` here can be a large allocation
+    /// entirely off a caller's own timed hot path). Still waits on THIS readback's own handle,
+    /// same as `wait_and_read` — never the queue tail. `out` is fully overwritten (cleared, then
+    /// extended to exactly `self.count` elements), so a shorter previous read can never leave a
+    /// stale tail behind.
+    pub fn wait_and_read_into(self, out: &mut Vec<T>) {
+        self.handle.wait_until_completed();
+        read_to_vec_into(&self.buffer, self.count, out);
+    }
+
+    /// The dtype this readback was encoded for (`T::DTYPE` at construction time), for callers that
+    /// want to assert it matches before committing to a `T`.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
 }
 
 impl BackendDevice for MetalDevice {
@@ -2371,8 +2456,19 @@ impl BackendDevice for MetalDevice {
 }
 
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
+    let mut out = Vec::new();
+    read_to_vec_into(buffer, n, &mut out);
+    out
+}
+
+/// Shared by `read_to_vec` (fresh `Vec`) and `MetalPendingReadback::wait_and_read_into` (reused
+/// `out`): `clear()` before `extend_from_slice` means `out.len() == n` on return regardless of
+/// what it held before, so a caller that reuses `out` across calls never reads a stale tail from
+/// a longer prior call.
+fn read_to_vec_into<T: Clone>(buffer: &Buffer, n: usize, out: &mut Vec<T>) {
     let ptr = buffer.contents() as *const T;
     assert!(!ptr.is_null());
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
-    slice.to_vec()
+    out.clear();
+    out.extend_from_slice(slice);
 }

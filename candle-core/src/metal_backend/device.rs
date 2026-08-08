@@ -4,8 +4,8 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        BlitCommandsGuard, Buffer, BufferMap, Commands, CommandsGuard, Device, MTLResourceOptions,
-        ResidencySet,
+        BlitCommandsGuard, Buffer, BufferMap, CommandBuffer, Commands, CommandsGuard, Device,
+        MTLResourceOptions, ResidencySet,
     },
     Kernels,
 };
@@ -184,6 +184,26 @@ impl MetalDevice {
 
         self.drop_unused_buffers()?;
         Ok(())
+    }
+
+    /// Commit any pending ops WITHOUT waiting. Does not run `drop_unused_buffers` (nothing has
+    /// synchronously completed to reclaim against) — a caller on a no-wait path should still
+    /// reclaim periodically via `wait_until_completed`/`flush_and_wait_current` at whatever
+    /// cadence suits it, or pooled buffers accumulate at their high-water mark.
+    pub fn flush(&self) -> Result<()> {
+        self.commands.flush().map_err(MetalError::from)?;
+        Ok(())
+    }
+
+    /// Commit-without-wait, returning a waitable handle to the just-committed buffer:
+    /// `CommandBuffer::wait_until_completed` on the handle blocks until THIS buffer's GPU work is
+    /// done (a no-op if it already is) — unlike `wait_until_completed`/`flush_and_wait_current`,
+    /// which both wait on the queue TAIL (whatever is in flight at CALL time, which may include
+    /// unrelated work encoded after this call returns). Same buffer-pool caveat as `flush`: this
+    /// does not run `drop_unused_buffers`.
+    pub fn flush_returning_handle(&self) -> Result<CommandBuffer> {
+        let handle = self.commands.flush_returning_handle().map_err(MetalError::from)?;
+        Ok(handle)
     }
 
     pub fn kernels(&self) -> &Kernels {

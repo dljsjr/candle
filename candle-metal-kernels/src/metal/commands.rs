@@ -291,6 +291,29 @@ impl Commands {
         Ok(())
     }
 
+    /// Commit the current command buffer WITHOUT waiting, returning a clone of the just-committed
+    /// buffer as a waitable handle. Unlike [`Self::wait_until_completed`] /
+    /// [`Self::flush_and_wait_current`], which both block on `state.in_flight`'s LAST entry at
+    /// CALL time (the queue tail — which by the time of a later wait may include far more work
+    /// than the caller's own), the returned handle lets the caller wait on THIS SPECIFIC buffer
+    /// later, once its own GPU work is actually needed: `CommandBuffer::wait_until_completed` on
+    /// an already-completed buffer returns immediately (Apple's documented behavior), so a wait
+    /// deferred past enough other encoded work is effectively free. Mirrors
+    /// `flush_and_wait_current`'s unconditional commit (always commits, even if nothing new was
+    /// encoded since the last flush) so the returned handle always denotes "everything encoded up
+    /// to this call" — never a stale, already-superseded buffer.
+    pub fn flush_returning_handle(&self) -> Result<CommandBuffer, MetalKernelError> {
+        let mut state = self.state.lock()?;
+        self.commit_swap_locked(&mut state, 0)?;
+        // commit_swap_locked unconditionally pushes the just-committed buffer, so this is always
+        // populated — the same invariant `flush_and_wait_current` relies on via `.cloned()`.
+        Ok(state
+            .in_flight
+            .last()
+            .cloned()
+            .expect("commit_swap_locked always pushes exactly one buffer"))
+    }
+
     fn commit_swap_locked(
         &self,
         state: &mut EntryState,
