@@ -1,4 +1,4 @@
-use super::{BlitCommandEncoder, ComputeCommandEncoder, Device, Fence, PrevCeOutputs};
+use super::{BlitCommandEncoder, ComputeCommandEncoder, Device, Fence, LastFence};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLDispatchType};
@@ -18,33 +18,33 @@ impl CommandBuffer {
         Self { raw }
     }
 
-    /// Create a compute command encoder with the provided per-encoder fence and global output map.
+    /// Create a compute command encoder with the provided per-encoder fence.
     pub fn compute_command_encoder(&self, fence: &Arc<Fence>) -> ComputeCommandEncoder {
         self.as_ref()
             .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .map(|raw| ComputeCommandEncoder::new(raw, self.raw.clone(), Arc::clone(fence)))
+            .map(|raw| ComputeCommandEncoder::new(raw, Arc::clone(fence)))
             .unwrap()
     }
 
-    /// Create a compute command encoder with freshly allocated fence and a standalone output map.
-    /// Used by tests and `EncoderProvider` implementations that don't share a global fence map.
+    /// Create a compute command encoder with a freshly allocated, standalone fence.
+    /// Used by tests and `EncoderProvider` implementations that don't share the chained fence.
     pub fn compute_command_encoder_no_fence(&self) -> ComputeCommandEncoder {
         let device = Device::new(self.raw.device());
         let fence = Arc::new(Fence::new(&device));
         self.as_ref()
             .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .map(|raw| ComputeCommandEncoder::new(raw, self.raw.clone(), fence))
+            .map(|raw| ComputeCommandEncoder::new(raw, fence))
             .unwrap()
     }
 
     pub fn blit_command_encoder(
         &self,
         fence: &Arc<Fence>,
-        prev_ce_outputs: &PrevCeOutputs,
+        last_fence: &LastFence,
     ) -> BlitCommandEncoder {
         self.as_ref()
             .blitCommandEncoder()
-            .map(|raw| BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(prev_ce_outputs)))
+            .map(|raw| BlitCommandEncoder::new(raw, Arc::clone(fence), Arc::clone(last_fence)))
             .unwrap()
     }
 

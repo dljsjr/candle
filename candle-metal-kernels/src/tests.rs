@@ -2451,3 +2451,66 @@ fn commands_concurrent_acquisition() {
 
     commands.wait_until_completed().unwrap();
 }
+
+/// `flush_and_wait` (behind `wait_until_completed`) leaves the chained `last_fence` in place
+/// rather than resetting it to `None` — waiting on an already-signaled fence is a no-op, so the
+/// next encoder created on the same `Commands` after a flush waits on a stale-but-satisfied
+/// fence. No existing test exercised that "idle, then keep encoding" sequence, so this pins it:
+/// a second round of real dispatch + readback on the same `Commands`, after a flush, must
+/// neither hang nor corrupt results.
+#[test]
+fn commands_survive_flush_then_more_encoding() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+
+    let v1 = vec![1.0f32, 2.0, 3.0];
+    let input1 = new_buffer(&device, &v1);
+    let output1 = new_buffer(&device, &v1);
+    let encoder = commands.command_encoder().unwrap();
+    call_unary_contiguous(
+        &device,
+        &encoder,
+        &kernels,
+        unary::contiguous::cos::FLOAT,
+        size_of::<f32>(),
+        v1.len(),
+        BufferOffset::zero_offset(&input1),
+        &output1,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let expected1: Vec<_> = v1.iter().map(|v| v.cos()).collect();
+    assert_eq!(
+        approx(read_to_vec(&output1, v1.len()), 4),
+        approx(expected1, 4)
+    );
+
+    // Second round, same `Commands`, after the flush above. `command_encoder()` here waits on
+    // whatever `last_fence` was left over from round 1 — this is the previously-unexercised path.
+    let v2 = vec![4.0f32, 5.0, 6.0];
+    let input2 = new_buffer(&device, &v2);
+    let output2 = new_buffer(&device, &v2);
+    let encoder = commands.command_encoder().unwrap();
+    call_unary_contiguous(
+        &device,
+        &encoder,
+        &kernels,
+        unary::contiguous::cos::FLOAT,
+        size_of::<f32>(),
+        v2.len(),
+        BufferOffset::zero_offset(&input2),
+        &output2,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    let expected2: Vec<_> = v2.iter().map(|v| v.cos()).collect();
+    assert_eq!(
+        approx(read_to_vec(&output2, v2.len()), 4),
+        approx(expected2, 4)
+    );
+}

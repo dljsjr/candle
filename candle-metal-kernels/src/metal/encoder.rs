@@ -2,19 +2,20 @@ use crate::metal::{Buffer, ComputePipeline, Fence};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
-    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLSize,
+    MTLBarrierScope, MTLBlitCommandEncoder, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ffi::c_void,
     ptr,
     sync::{Arc, Mutex},
 };
 
-/// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
-/// Used by subsequent encoders to call waitForFence before reading those buffers.
-pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
+/// Shared chained fence: the fence of the immediately preceding encoder (compute or blit), if
+/// any. Encoders are created strictly serially, so each new encoder waiting on just this one
+/// fence transitively covers every earlier write — fence transitivity means there's no need to
+/// track which encoder wrote which buffer.
+pub type LastFence = Arc<Mutex<Option<Arc<Fence>>>>;
 
 /// Barrier tracking state for one encoder session.
 /// Owned by ComputeCommandEncoder via Arc<Mutex<>> so clones share state.
@@ -28,8 +29,6 @@ pub struct EncoderState {
     pub needs_barrier: bool,
     /// All inputs seen this encoder session (cross-encoder fence coordination).
     pub all_inputs: HashSet<usize>,
-    /// All outputs seen this encoder session (registered in global map at end_encoding).
-    pub all_outputs: HashSet<usize>,
 }
 
 impl EncoderState {
@@ -41,7 +40,6 @@ impl EncoderState {
             next_inputs: HashSet::new(),
             needs_barrier: false,
             all_inputs: HashSet::new(),
-            all_outputs: HashSet::new(),
         }
     }
 }
@@ -49,8 +47,6 @@ impl EncoderState {
 #[derive(Clone)]
 pub struct ComputeCommandEncoder {
     pub(crate) raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-    /// Retained so we can register completion handlers on this CB.
-    pub(crate) command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     /// Per-encoder-session fence. Updated at end_encoding.
     pub(crate) fence: Arc<Fence>,
     /// Hazard tracking state. Arc shared between the canonical encoder in EntryState
@@ -68,12 +64,10 @@ impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
 impl ComputeCommandEncoder {
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
-        command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         fence: Arc<Fence>,
     ) -> ComputeCommandEncoder {
         ComputeCommandEncoder {
             raw,
-            command_buffer,
             fence,
             state: Arc::new(Mutex::new(EncoderState::new())),
         }
@@ -140,7 +134,6 @@ impl ComputeCommandEncoder {
                 s.needs_barrier = true;
             }
             s.next_outputs.insert(ptr);
-            s.all_outputs.insert(ptr);
         }
         unsafe {
             self.raw
@@ -223,10 +216,8 @@ pub struct BlitCommandEncoder {
     pub(crate) raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
     /// Per-encoder fence, updated at end_encoding.
     fence: Arc<Fence>,
-    /// Shared global cross-encoder output map.
-    prev_ce_outputs: PrevCeOutputs,
-    /// Buffer pointers written by this blit encoder (registered in global map at end_encoding).
-    tracked_outputs: Vec<usize>,
+    /// Shared chained fence: updated to this encoder's fence at end_encoding.
+    last_fence: LastFence,
 }
 
 impl AsRef<BlitCommandEncoder> for BlitCommandEncoder {
@@ -239,13 +230,12 @@ impl BlitCommandEncoder {
     pub fn new(
         raw: Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>,
         fence: Arc<Fence>,
-        prev_ce_outputs: PrevCeOutputs,
+        last_fence: LastFence,
     ) -> BlitCommandEncoder {
         BlitCommandEncoder {
             raw,
             fence,
-            prev_ce_outputs,
-            tracked_outputs: Vec::new(),
+            last_fence,
         }
     }
 
@@ -262,17 +252,11 @@ impl BlitCommandEncoder {
     pub fn end_encoding(&self) {
         use objc2_metal::MTLCommandEncoder as _;
 
-        // Signal this blit encoder's fence after all blit commands complete
+        // Signal this blit encoder's fence after all blit commands complete, and chain it as
+        // the wait target for whatever encoder comes next.
         self.update_fence(&self.fence);
         self.raw.endEncoding();
-
-        // Register outputs so subsequent encoders can wait.
-        {
-            let mut map = self.prev_ce_outputs.lock().unwrap();
-            for &out in &self.tracked_outputs {
-                map.insert(out, Arc::clone(&self.fence));
-            }
-        }
+        *self.last_fence.lock().unwrap() = Some(Arc::clone(&self.fence));
     }
 
     pub fn set_label(&self, label: &str) {
@@ -280,8 +264,11 @@ impl BlitCommandEncoder {
         self.raw.setLabel(Some(&NSString::from_str(label)))
     }
 
-    /// Copy bytes from src to dst. Waits on any fence that wrote to src_buffer to ensure
-    /// correct ordering for HazardTrackingModeUntracked buffers.
+    /// Copy bytes from src to dst. Ordering against prior encoders' writes is already
+    /// established by the wait the owning `Commands::blit_command_encoder` performs before
+    /// any blit command is encoded (see `LastFence`); blit commands within one encoder then
+    /// execute in encoding order per Metal's ordering guarantee, so no per-call fence wait is
+    /// needed here.
     pub fn copy_from_buffer(
         &mut self,
         src_buffer: &Buffer,
@@ -290,18 +277,6 @@ impl BlitCommandEncoder {
         dst_offset: usize,
         size: usize,
     ) {
-        let src_ptr = src_buffer.raw_ptr() as usize;
-        let fence_to_wait = {
-            let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&src_ptr).cloned()
-        };
-        if let Some(fence) = fence_to_wait {
-            use objc2_metal::MTLBlitCommandEncoder as _;
-            self.raw.waitForFence(fence.raw());
-        }
-
-        self.tracked_outputs.push(dst_buffer.raw_ptr() as usize);
-
         unsafe {
             self.raw
                 .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -315,17 +290,6 @@ impl BlitCommandEncoder {
     }
 
     pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
-        let ptr = buffer.raw_ptr() as usize;
-        let fence_to_wait = {
-            let map = self.prev_ce_outputs.lock().unwrap();
-            map.get(&ptr).cloned()
-        };
-        if let Some(fence) = fence_to_wait {
-            use objc2_metal::MTLBlitCommandEncoder as _;
-            self.raw.waitForFence(fence.raw());
-        }
-        self.tracked_outputs.push(ptr);
-
         self.raw.fillBuffer_range_value(
             buffer.as_ref(),
             NSRange {

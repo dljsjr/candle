@@ -1,13 +1,10 @@
 use crate::metal::{
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    Fence, PrevCeOutputs, ResidencySet,
+    Fence, LastFence, ResidencySet,
 };
 use crate::MetalKernelError;
-use block2::RcBlock;
 use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
-use std::collections::HashMap;
-use std::ptr::NonNull;
+use objc2_metal::{MTLCommandBufferStatus, MTLCommandQueue};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -120,9 +117,13 @@ pub struct Commands {
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
     device: Device,
-    /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
-    /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
-    prev_ce_outputs: PrevCeOutputs,
+    /// Fence of the immediately preceding encoder (compute or blit), if any. Encoders are
+    /// created strictly serially — guarded by `state` — so each new encoder only needs to wait
+    /// on this one fence: fence transitivity (each encoder already waited on its own
+    /// predecessor before running) makes that equivalent to waiting on every earlier write,
+    /// without per-buffer bookkeeping. Lives on `Commands` (not `EntryState`) so it carries
+    /// across `commit_swap_locked` command-buffer boundaries.
+    last_fence: LastFence,
 }
 
 unsafe impl Send for Commands {}
@@ -153,7 +154,7 @@ impl Commands {
             command_queue,
             compute_per_buffer,
             device,
-            prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
+            last_fence: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -169,18 +170,14 @@ impl Commands {
         if state_guard.current_encoder.is_none() {
             let fence = Arc::new(Fence::new(&self.device));
             let enc = state_guard.current.compute_command_encoder(&fence);
-            // Wait for all prior encoder fences before the first dispatch.
-            // Using HazardTrackingModeUntracked implies that Metal does not automatically flush GPU caches
-            // at encoder or command buffer boundaries.
+            // Wait for the previous encoder's fence before the first dispatch. Because
+            // encoders are created strictly serially, this single wait transitively covers
+            // every earlier write. Using HazardTrackingModeUntracked implies that Metal does
+            // not automatically flush GPU caches at encoder or command buffer boundaries.
             {
-                use std::collections::HashSet;
-                let map = self.prev_ce_outputs.lock().unwrap();
-                let mut seen = HashSet::new();
-                for f in map.values() {
-                    let ptr = Arc::as_ptr(f) as usize;
-                    if seen.insert(ptr) {
-                        enc.wait_for_fence(f);
-                    }
+                let guard = self.last_fence.lock().unwrap();
+                if let Some(prev) = guard.as_ref() {
+                    enc.wait_for_fence(prev);
                 }
             }
             state_guard.current_encoder = Some(enc);
@@ -206,19 +203,15 @@ impl Commands {
         let fence = Arc::new(Fence::new(&self.device));
         let encoder = state_guard
             .current
-            .blit_command_encoder(&fence, &self.prev_ce_outputs);
+            .blit_command_encoder(&fence, &self.last_fence);
 
-        // Wait for all prior encoder fences before any blit commands execute.
-        // Required for HazardTrackingModeUntracked: GPU caches are not auto-flushed.
+        // Wait for the previous encoder's fence before any blit commands execute (same
+        // chained-fence reasoning as `command_encoder` above). Required for
+        // HazardTrackingModeUntracked: GPU caches are not auto-flushed.
         {
-            use std::collections::HashSet;
-            let map = self.prev_ce_outputs.lock().unwrap();
-            let mut seen = HashSet::new();
-            for f in map.values() {
-                let ptr = Arc::as_ptr(f) as usize;
-                if seen.insert(ptr) {
-                    encoder.wait_for_fence(f);
-                }
+            let guard = self.last_fence.lock().unwrap();
+            if let Some(prev) = guard.as_ref() {
+                encoder.wait_for_fence(prev);
             }
         }
 
@@ -258,7 +251,14 @@ impl Commands {
             }
         }
 
-        self.prev_ce_outputs.lock()?.clear();
+        // Deliberately NOT resetting last_fence here. Everything queued before `to_wait` was
+        // snapshotted is now GPU-complete (ensure_completed + Metal's FIFO CB ordering), so
+        // waiting on it again is a no-op — an already-signaled fence is satisfied immediately.
+        // Resetting to None would have to happen after `to_wait` is taken, i.e. outside the
+        // `state` lock: a concurrent thread could acquire `state`, encode + end an encoder,
+        // and publish its fence as the new last_fence in that window, which a reset here would
+        // then discard, breaking the chain for whoever comes after. Leaving the stale fence in
+        // place is strictly conservative (worst case one harmless extra wait) and race-free.
 
         Ok(())
     }
@@ -341,43 +341,10 @@ impl Commands {
         use objc2_metal::MTLCommandEncoder as _;
         use objc2_metal::MTLComputeCommandEncoder as _;
 
-        let all_outputs = {
-            let s = encoder.state.lock().unwrap();
-            s.all_outputs.clone()
-        };
-
-        {
-            let mut prev_ce_outputs = self.prev_ce_outputs.lock().unwrap();
-            // Register our outputs so subsequent encoders can wait for us.
-            for output in all_outputs.iter() {
-                let _ = prev_ce_outputs.insert(*output, encoder.fence.clone());
-            }
-        }
-
-        // Signal this encoder's completion fence and end encoding.
+        // Signal this encoder's completion fence, chain it as the wait target for whatever
+        // encoder comes next (compute or blit), and end encoding.
         encoder.raw.updateFence(encoder.fence.raw());
-
-        // Schedule cleanup of our output entries once the GPU completes.
-        if !all_outputs.is_empty() {
-            let fence_for_cleanup = Arc::clone(&encoder.fence);
-            let map_for_cleanup = Arc::clone(&self.prev_ce_outputs);
-            let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                let mut map = map_for_cleanup.lock().unwrap();
-                for &buf in &all_outputs {
-                    if let Some(f) = map.get(&buf) {
-                        if Arc::ptr_eq(f, &fence_for_cleanup) {
-                            map.remove(&buf);
-                        }
-                    }
-                }
-            });
-            unsafe {
-                encoder
-                    .command_buffer
-                    .addCompletedHandler(RcBlock::as_ptr(&block))
-            };
-        }
-
+        *self.last_fence.lock().unwrap() = Some(Arc::clone(&encoder.fence));
         encoder.raw.endEncoding();
     }
 }
